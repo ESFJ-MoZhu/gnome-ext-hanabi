@@ -1790,7 +1790,7 @@ function createProjectBrowserDialog(window, settings) {
             currentInspectorProject,
             currentInspectorOverrides
         );
-        updateInspectorSensitivity();
+        updateInspectorVisibility();
     };
 
     function createInspectorPropertyWidget(property) {
@@ -1980,7 +1980,16 @@ function createProjectBrowserDialog(window, settings) {
         }
     }
 
-    function updateInspectorSensitivity() {
+    /**
+     * Applies project.json display conditions to the inspector layout.
+     *
+     * The inspector rows are created once in project.json order, so hiding
+     * inactive rows is intentionally preferred over rebuilding the visible
+     * subset. GTK removes hidden rows from layout without changing sibling
+     * order, which keeps language-driven configuration groups visually correct
+     * while preserving every visible property's relative order.
+     */
+    function updateInspectorVisibility() {
         if (!currentInspectorProject)
             return;
 
@@ -1988,26 +1997,30 @@ function createProjectBrowserDialog(window, settings) {
         const enabledMap = new Map();
 
         inspectorSections.forEach(section => {
-            const groupEnabled = section.groupProperty
+            const groupVisible = section.groupProperty
                 ? isScenePropertyVisible(currentInspectorProject, section.groupProperty, valueMap, enabledMap)
                 : true;
+            let visibleRowCount = 0;
 
             section.rows.forEach(entry => {
-                const rowEnabled = isScenePropertyVisible(
+                const rowVisible = groupVisible && isScenePropertyVisible(
                     currentInspectorProject,
                     entry.property,
                     valueMap,
                     enabledMap
                 );
-                entry.widget.sensitive = groupEnabled && rowEnabled;
+                entry.widget.visible = rowVisible;
+                entry.widget.sensitive = rowVisible;
+                if (rowVisible)
+                    visibleRowCount++;
             });
 
             if (section.groupHeader) {
-                section.groupHeader.visible = section.rows.length > 0;
-                section.groupHeader.sensitive = groupEnabled;
+                section.groupHeader.visible = groupVisible && visibleRowCount > 0;
+                section.groupHeader.sensitive = groupVisible;
             }
-            section.groupWidget.visible = section.rows.length > 0;
-            section.groupWidget.sensitive = groupEnabled;
+            section.groupWidget.visible = groupVisible && visibleRowCount > 0;
+            section.groupWidget.sensitive = groupVisible;
         });
     }
 
@@ -2080,7 +2093,7 @@ function createProjectBrowserDialog(window, settings) {
         });
 
         inspectorStack.set_visible_child_name('content');
-        updateInspectorSensitivity();
+        updateInspectorVisibility();
     }
 
     const refreshInspector = () => {
