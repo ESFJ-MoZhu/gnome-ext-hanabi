@@ -9,6 +9,15 @@ import Soup from 'gi://Soup?version=3.0';
 
 import {gettext as _} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
+let Gly = null;
+let GlyGtk4 = null;
+try {
+    Gly = (await import('gi://Gly?version=2')).default;
+    GlyGtk4 = (await import('gi://GlyGtk4?version=2')).default;
+} catch (error) {
+    console.warn(`Hanabi preferences: animated image decoding is disabled because glycin is unavailable: ${error}`);
+}
+
 import {
     ProjectBrowserFilterKey,
     ProjectContentRatings,
@@ -937,28 +946,65 @@ function decodeScenePropertyMarkupEntities(text) {
         .replace(/&#39;/gi, '\'');
 }
 
-function balanceScenePropertyMarkup(markup) {
-    const supportedTags = ['big', 'b', 'i', 'small', 'u'];
-    const tagPattern = /<(\/?)(big|b|i|small|u)\s*>|<(\/?)a\b[^>]*>/gi;
+/**
+ * Repair the small Pango markup subset emitted for scene property labels.
+ *
+ * @param {string} markup Markup generated from loose Workshop HTML.
+ * @returns {string} Markup with stray closers ignored and open tags balanced.
+ */
+function normalizeScenePropertyMarkupNesting(markup) {
+    // Workshop metadata is authored as loose HTML, but Gtk.Label consumes the
+    // much stricter Pango markup subset. One unmatched or wrongly ordered close
+    // tag makes Pango reject the entire label, so this pass only repairs the
+    // tags we intentionally emit while leaving already-escaped text untouched.
+    const tagPattern = /<(\/?)(big|b|i|small|u)\s*>|<a\b[^>]*>|<\/a>/gi;
     const stack = [];
+    const chunks = [];
     let match = null;
+    let lastIndex = 0;
 
     while ((match = tagPattern.exec(markup)) !== null) {
         const fullMatch = match[0];
-        const closing = (match[1] ?? match[3] ?? '') === '/';
+        const closing = fullMatch.startsWith('</') || match[1] === '/';
         const tagName = (match[2] ?? 'a').toLowerCase();
+        chunks.push(markup.slice(lastIndex, match.index));
+        lastIndex = tagPattern.lastIndex;
 
-        if (closing || fullMatch.startsWith('</')) {
-            const openIndex = stack.lastIndexOf(tagName);
-            if (openIndex >= 0)
-                stack.splice(openIndex, 1);
+        if (!closing) {
+            stack.push({name: tagName, markup: fullMatch});
+            chunks.push(fullMatch);
             continue;
         }
 
-        stack.push(tagName);
+        let openIndex = -1;
+        for (let index = stack.length - 1; index >= 0; index--) {
+            if (stack[index].name === tagName) {
+                openIndex = index;
+                break;
+            }
+        }
+
+        if (openIndex < 0)
+            continue;
+
+        const temporarilyClosed = stack.splice(openIndex + 1);
+        for (let index = temporarilyClosed.length - 1; index >= 0; index--)
+            chunks.push(`</${temporarilyClosed[index].name}>`);
+
+        const closedTag = stack.pop();
+        chunks.push(`</${closedTag.name}>`);
+
+        temporarilyClosed.forEach(tag => {
+            stack.push(tag);
+            chunks.push(tag.markup);
+        });
     }
 
-    return markup + stack.reverse().map(tag => `</${tag}>`).join('');
+    chunks.push(markup.slice(lastIndex));
+    for (let index = stack.length - 1; index >= 0; index--)
+        chunks.push(`</${stack[index].name}>`);
+
+    return chunks.join('');
 }
 
 function formatScenePropertyMarkup(text, fallback = _('Untitled')) {
@@ -983,6 +1029,7 @@ function formatScenePropertyMarkup(text, fallback = _('Untitled')) {
         .replace(/\r\n?/g, '\n')
         .replace(/<br\s*\/?>/gi, '\n')
         .replace(/<hr\s*\/?>/gi, '\n')
+        .replace(/<a\b[^>]*>\s*<img\b[^>]*\/?>\s*<\/a>/gi, '\n')
         .replace(/<\/?(p|div|center)\b[^>]*>/gi, '\n')
         .replace(/<img\b[^>]*>/gi, '\n')
         .replace(/<a\b([^>]*)>|<\/a>/gi, (match, attributes) => {
@@ -1031,45 +1078,106 @@ function formatScenePropertyMarkup(text, fallback = _('Untitled')) {
             .join(href ? '</a>' : '</u>');
     });
 
-    return balanceScenePropertyMarkup(markup);
+    return normalizeScenePropertyMarkupNesting(markup);
 }
 
 function scenePropertyUsesCenteredMarkup(text) {
     return typeof text === 'string' && /<center\b/i.test(text);
 }
 
-function parseScenePropertyImages(text) {
+/**
+ * Read one attribute from loose Workshop HTML.
+ *
+ * @param {string} attributes Raw attribute text from an opening tag.
+ * @param {string} attributeName Attribute name to read.
+ * @returns {string} Decoded attribute value, or an empty string.
+ */
+function parseScenePropertyHtmlAttribute(attributes, attributeName) {
+    const quotedMatch = attributes.match(new RegExp(`\\b${attributeName}\\s*=\\s*(['"])(.*?)\\1`, 'i'));
+    const unquotedMatch = attributes.match(new RegExp(`\\b${attributeName}\\s*=\\s*([^\\s>]+)`, 'i'));
+    return decodeScenePropertyMarkupEntities(
+        quotedMatch?.[2] ?? unquotedMatch?.[1] ?? ''
+    ).trim();
+}
+
+/**
+ * Extract href from an opening anchor tag.
+ *
+ * @param {string} anchorTag Raw `<a ...>` tag text.
+ * @returns {string} Decoded href value, or an empty string.
+ */
+function parseScenePropertyAnchorHref(anchorTag) {
+    const attributes = anchorTag.match(/<a\b([^>]*)>/i)?.[1] ?? '';
+    return parseScenePropertyHtmlAttribute(attributes, 'href');
+}
+
+/**
+ * Check whether a scheme-less href is probably an external web URL.
+ *
+ * @param {string} href Href without an explicit URI scheme.
+ * @returns {boolean} True when the href starts with a host-like domain.
+ */
+function scenePropertyHrefLooksLikeWebHost(href) {
+    return /^[a-z0-9-]+(\.[a-z0-9-]+)+(?:[/?#:]|$)/i.test(href);
+}
+
+/**
+ * Parse one loose HTML image tag into the data needed by the image widget.
+ *
+ * @param {string} imageTag Raw `<img>` tag text from project metadata.
+ * @returns {?object} Image source and optional dimensions, or null.
+ */
+function parseScenePropertyImageTag(imageTag) {
+    const attributes = imageTag.match(/<img\b([^>]*)\/?>/i)?.[1] ?? '';
+    const src = parseScenePropertyHtmlAttribute(attributes, 'src');
+    const width = Number.parseFloat(parseScenePropertyHtmlAttribute(attributes, 'width'));
+    const height = Number.parseFloat(parseScenePropertyHtmlAttribute(attributes, 'height'));
+
+    if (!src)
+        return null;
+
+    return {
+        src,
+        width: Number.isFinite(width) && width > 0 ? Math.round(width) : null,
+        height: Number.isFinite(height) && height > 0 ? Math.round(height) : null,
+    };
+}
+
+/**
+ * Locate image blocks while keeping their original positions in rich text.
+ *
+ * @param {string} text Raw scene property text from project metadata.
+ * @returns {object[]} Ordered image blocks with source ranges and image data.
+ */
+function parseScenePropertyImageBlocks(text) {
     if (typeof text !== 'string')
         return [];
 
-    const images = [];
-    const imagePattern = /<img\b([^>]*)\/?>/gi;
+    const blocks = [];
+    const imagePattern = /(<a\b[^>]*>)\s*(<img\b[^>]*\/?>)\s*<\/a>|(<img\b[^>]*\/?>)/gi;
     let match = null;
 
     while ((match = imagePattern.exec(text)) !== null) {
-        const attributes = match[1] ?? '';
-        const getAttribute = attributeName => {
-            const quotedMatch = attributes.match(new RegExp(`\\b${attributeName}\\s*=\\s*(['"])(.*?)\\1`, 'i'));
-            const unquotedMatch = attributes.match(new RegExp(`\\b${attributeName}\\s*=\\s*([^\\s>]+)`, 'i'));
-            return decodeScenePropertyMarkupEntities(
-                quotedMatch?.[2] ?? unquotedMatch?.[1] ?? ''
-            ).trim();
-        };
-        const src = getAttribute('src');
-        const width = Number.parseFloat(getAttribute('width'));
-        const height = Number.parseFloat(getAttribute('height'));
-
-        if (!src)
+        const image = parseScenePropertyImageTag(match[2] ?? match[3] ?? '');
+        if (!image)
             continue;
 
-        images.push({
-            src,
-            width: Number.isFinite(width) && width > 0 ? Math.round(width) : null,
-            height: Number.isFinite(height) && height > 0 ? Math.round(height) : null,
+        const href = parseScenePropertyAnchorHref(match[1] ?? '');
+        if (href)
+            image.href = href;
+
+        blocks.push({
+            start: match.index,
+            end: imagePattern.lastIndex,
+            image,
         });
     }
 
-    return images;
+    return blocks;
+}
+
+function parseScenePropertyImages(text) {
+    return parseScenePropertyImageBlocks(text).map(block => block.image);
 }
 
 function formatScenePropertyDisplayTitle(text, fallback = _('Untitled')) {
@@ -1566,30 +1674,93 @@ function createProjectBrowserDialog(window, settings) {
         return Gio.File.new_for_path(GLib.build_filenamev([currentInspectorProject.path, source]));
     };
 
-    const createSceneImageWidget = (image, maxWidth) => {
+    const normalizeSceneImageLinkUri = href => {
+        if (!href)
+            return null;
+
+        const uri = href.trim();
+        if (!uri)
+            return null;
+
+        if (/^[a-z][a-z0-9+.-]*:/i.test(uri))
+            return uri;
+
+        if (uri.startsWith('//'))
+            return `https:${uri}`;
+
+        if (!scenePropertyHrefLooksLikeWebHost(uri))
+            return null;
+
+        return `https://${uri}`;
+    };
+
+    const openSceneImageLink = uri => {
+        try {
+            Gio.AppInfo.launch_default_for_uri_async(uri, null, null, (_source, result) => {
+                try {
+                    Gio.AppInfo.launch_default_for_uri_finish(result);
+                } catch (error) {
+                    console.warn(`Hanabi preferences: failed to open scene image link "${uri}": ${error}`);
+                }
+            });
+        } catch (error) {
+            console.warn(`Hanabi preferences: failed to open scene image link "${uri}": ${error}`);
+        }
+    };
+
+    const calculateSceneImageSizeRequest = (image, naturalWidth, naturalHeight, maxWidth) => {
+        naturalWidth = Math.max(1, naturalWidth);
+        naturalHeight = Math.max(1, naturalHeight);
+        let requestedWidth = image.width ?? naturalWidth;
+        let requestedHeight = image.height ?? naturalHeight;
+
+        // Gtk.Picture reports a vertical minimum of zero for paintables with no
+        // explicit height request. The inspector rows use those minimum sizes,
+        // so remote Workshop images without width/height metadata can decode
+        // successfully yet still receive no visible allocation. Always derive a
+        // concrete size from the decoded texture while preserving aspect ratio.
+        if (image.width && !image.height)
+            requestedHeight = Math.round(naturalHeight * image.width / naturalWidth);
+        else if (!image.width && image.height)
+            requestedWidth = Math.round(naturalWidth * image.height / naturalHeight);
+
+        const scale = Math.min(1, maxWidth / Math.max(1, requestedWidth));
+        return {
+            width: Math.max(1, Math.round(requestedWidth * scale)),
+            height: Math.max(1, Math.round(requestedHeight * scale)),
+        };
+    };
+
+    const createSceneImageWidget = (image, maxWidth, centered = false) => {
+        const alignment = centered ? Gtk.Align.CENTER : Gtk.Align.START;
         const box = new Gtk.Box({
             orientation: Gtk.Orientation.VERTICAL,
             spacing: 6,
-            halign: Gtk.Align.START,
+            halign: alignment,
             valign: Gtk.Align.CENTER,
         });
         const picture = new Gtk.Picture({
             can_shrink: true,
             content_fit: Gtk.ContentFit.SCALE_DOWN,
-            halign: Gtk.Align.START,
+            halign: alignment,
             visible: false,
         });
         const spinner = new Gtk.Spinner({
             spinning: true,
-            halign: Gtk.Align.START,
+            halign: alignment,
         });
         const errorLabel = new Gtk.Label({
-            xalign: 0,
+            xalign: centered ? 0.5 : 0,
             wrap: true,
             visible: false,
+            justify: centered ? Gtk.Justification.CENTER : Gtk.Justification.LEFT,
             css_classes: ['dim-label'],
             label: _('Image unavailable'),
         });
+        const linkUri = normalizeSceneImageLinkUri(image.href);
+        let destroyed = false;
+        let animationTimerId = 0;
+        let activeImage = null;
 
         picture.set_size_request(
             Math.min(image.width ?? maxWidth, maxWidth),
@@ -1600,22 +1771,110 @@ function createProjectBrowserDialog(window, settings) {
         box.append(errorLabel);
 
         const showError = () => {
+            if (destroyed)
+                return;
+
             spinner.visible = false;
             picture.visible = false;
             errorLabel.visible = true;
         };
 
-        const applyTexture = texture => {
+        const applyPaintable = (paintable, naturalWidth, naturalHeight) => {
+            if (destroyed)
+                return;
+
+            const sizeRequest = calculateSceneImageSizeRequest(image, naturalWidth, naturalHeight, maxWidth);
             spinner.visible = false;
             errorLabel.visible = false;
             picture.visible = true;
-            picture.set_paintable(texture);
-
-            if (!image.width)
-                picture.width_request = Math.min(texture.get_width(), maxWidth);
-            if (!image.height)
-                picture.height_request = -1;
+            picture.set_size_request(sizeRequest.width, sizeRequest.height);
+            picture.set_paintable(paintable);
         };
+
+        const applyTexture = texture => {
+            applyPaintable(texture, texture.get_width(), texture.get_height());
+        };
+
+        const clearAnimationTimer = () => {
+            if (!animationTimerId)
+                return;
+
+            GLib.source_remove(animationTimerId);
+            animationTimerId = 0;
+        };
+
+        const playGlyImageFrame = imageHandle => {
+            if (destroyed)
+                return;
+
+            imageHandle.next_frame_async(null, (source, result) => {
+                if (destroyed)
+                    return;
+
+                try {
+                    const frame = source.next_frame_finish(result);
+                    applyTexture(GlyGtk4.frame_get_texture(frame));
+
+                    const delayMs = Math.round(frame.get_delay() / 1000);
+                    if (delayMs <= 0)
+                        return;
+
+                    clearAnimationTimer();
+                    animationTimerId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, Math.max(delayMs, 16), () => {
+                        animationTimerId = 0;
+                        playGlyImageFrame(imageHandle);
+                        return GLib.SOURCE_REMOVE;
+                    });
+                } catch (error) {
+                    if (error.matches?.(Gly.LoaderError, Gly.LoaderError.NO_MORE_FRAMES))
+                        return;
+
+                    console.warn(`Hanabi preferences: failed to decode animated scene image frame "${image.src}": ${error}`);
+                }
+            });
+        };
+
+        const applyGlyImage = (loader, fallback = null) => {
+            loader.load_async(null, (source, result) => {
+                if (destroyed)
+                    return;
+
+                try {
+                    activeImage = source.load_finish(result);
+                    playGlyImageFrame(activeImage);
+                } catch (error) {
+                    console.warn(`Hanabi preferences: failed to decode scene image "${image.src}" with glycin: ${error}`);
+                    fallback?.();
+                }
+            });
+        };
+
+        const applyImageBytes = bytes => {
+            if (Gly && GlyGtk4) {
+                applyGlyImage(
+                    Gly.Loader.new_for_bytes(bytes),
+                    () => applyTexture(Gdk.Texture.new_from_bytes(bytes))
+                );
+                return;
+            }
+
+            applyTexture(Gdk.Texture.new_from_bytes(bytes));
+        };
+
+        box.connect('destroy', () => {
+            destroyed = true;
+            clearAnimationTimer();
+            activeImage = null;
+            picture.set_paintable(null);
+        });
+
+        if (linkUri) {
+            const gesture = new Gtk.GestureClick({button: PROJECT_CARD_PRIMARY_BUTTON});
+            gesture.connect('released', (_gesture, _nPress, _x, _y) => openSceneImageLink(linkUri));
+            box.add_controller(gesture);
+            box.tooltip_text = linkUri;
+            box.set_cursor(Gdk.Cursor.new_from_name('pointer', null));
+        }
 
         try {
             if (/^https?:\/\//i.test(image.src)) {
@@ -1623,7 +1882,7 @@ function createProjectBrowserDialog(window, settings) {
                 sceneImageSession.send_and_read_async(message, GLib.PRIORITY_DEFAULT, null, (session, result) => {
                     try {
                         const bytes = session.send_and_read_finish(result);
-                        applyTexture(Gdk.Texture.new_from_bytes(bytes));
+                        applyImageBytes(bytes);
                     } catch (_error) {
                         showError();
                     }
@@ -1634,7 +1893,14 @@ function createProjectBrowserDialog(window, settings) {
                     showError();
                     return box;
                 }
-                applyTexture(Gdk.Texture.new_from_file(file));
+                if (Gly && GlyGtk4) {
+                    applyGlyImage(
+                        Gly.Loader.new(file),
+                        () => applyTexture(Gdk.Texture.new_from_file(file))
+                    );
+                } else {
+                    applyTexture(Gdk.Texture.new_from_file(file));
+                }
             }
         } catch (_error) {
             showError();
@@ -1643,55 +1909,53 @@ function createProjectBrowserDialog(window, settings) {
         return box;
     };
 
-    const buildSceneImageStrip = (text, maxWidth) => {
-        const images = parseScenePropertyImages(text);
-        if (images.length === 0)
-            return null;
-
-        const box = new Gtk.Box({
-            orientation: Gtk.Orientation.VERTICAL,
-            spacing: 8,
-            halign: Gtk.Align.START,
-            valign: Gtk.Align.CENTER,
-            margin_top: 4,
-            margin_bottom: 4,
-            width_request: maxWidth,
-        });
-        images.forEach(image => {
-            box.append(createSceneImageWidget(image, maxWidth));
-        });
-        return box;
-    };
-
     const buildSceneMarkupContentWidget = (text, fallback, maxWidth) => {
+        const centered = scenePropertyUsesCenteredMarkup(text);
         const box = new Gtk.Box({
             orientation: Gtk.Orientation.VERTICAL,
             spacing: 8,
             hexpand: false,
             valign: Gtk.Align.CENTER,
         });
-        const plainText = formatScenePropertyDisplayTitle(text, fallback);
-        if (plainText) {
+
+        let hasContent = false;
+        const appendTextSegment = segment => {
+            const plainText = formatScenePropertyDisplayTitle(segment, '');
+            if (!plainText)
+                return;
+
             const textLabel = new Gtk.Label({
-                label: formatScenePropertyMarkup(text, fallback),
+                label: formatScenePropertyMarkup(segment, ''),
                 use_markup: true,
-                xalign: scenePropertyUsesCenteredMarkup(text) ? 0.5 : 0,
+                xalign: centered ? 0.5 : 0,
                 wrap: true,
                 wrap_mode: Pango.WrapMode.WORD_CHAR,
-                justify: scenePropertyUsesCenteredMarkup(text)
-                    ? Gtk.Justification.CENTER
-                    : Gtk.Justification.LEFT,
+                justify: centered ? Gtk.Justification.CENTER : Gtk.Justification.LEFT,
                 max_width_chars: 36,
                 selectable: true,
                 tooltip_text: plainText,
                 width_request: maxWidth,
             });
             box.append(textLabel);
-        }
+            hasContent = true;
+        };
 
-        const imageStrip = buildSceneImageStrip(text, maxWidth);
-        if (imageStrip)
-            box.append(imageStrip);
+        // Wallpaper Engine authors often use HTML as a tiny layout language:
+        // text, linked image, more text, another image. Keeping that original
+        // sequence makes ABOUT/Donate/Workshop sections readable, while the
+        // formatter above remains responsible only for the strict Pango markup
+        // accepted by Gtk.Label.
+        let offset = 0;
+        parseScenePropertyImageBlocks(text).forEach(block => {
+            appendTextSegment(text.slice(offset, block.start));
+            box.append(createSceneImageWidget(block.image, maxWidth, centered));
+            hasContent = true;
+            offset = block.end;
+        });
+        appendTextSegment(typeof text === 'string' ? text.slice(offset) : '');
+
+        if (!hasContent)
+            appendTextSegment(fallback);
 
         const clamp = new Adw.Clamp({
             maximum_size: maxWidth,
@@ -1956,7 +2220,7 @@ function createProjectBrowserDialog(window, settings) {
             const contentWidget = buildSceneMarkupContentWidget(property.text, property.name, contentMaxWidth);
             return createInspectorControlRow({
                 title: title || property.name,
-                tooltipText: title,
+                tooltipText: null,
                 contentWidget,
             });
         }
