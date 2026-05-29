@@ -901,8 +901,10 @@ class ProjectPreviewTile {
             const paintable = this._paintable;
             this._paintable = null;
 
-            if (this.isGif && paintable.stop)
+            if (this.isGif && paintable.stop) {
+                console.log(`Hanabi preferences: preview tile gif stop path="${this.project.previewPath}"`);
                 paintable.stop();
+            }
 
             this._notifyPaintableChanged();
         }
@@ -917,6 +919,7 @@ class ProjectPreviewTile {
 
         if (this.isGif && HanabiGif?.GifPaintable) {
             this._startedUsec = GLib.get_monotonic_time();
+            console.log(`Hanabi preferences: preview tile gif start path="${this.project.previewPath}"`);
             this._paintable = createNativeGifPaintableForFile(
                 Gio.File.new_for_path(this.project.previewPath),
                 this._computeFramePhaseMs(this._visibleIndex)
@@ -1694,7 +1697,6 @@ function createProjectBrowserDialog(window, settings) {
         default_height: PROJECT_BROWSER_DIALOG_DEFAULT_HEIGHT,
     });
     dialog.add_button(_('Close'), Gtk.ResponseType.CLOSE);
-    dialog.connect('response', () => dialog.destroy());
 
     const content = dialog.get_content_area();
     content.set_spacing(12);
@@ -1903,6 +1905,8 @@ function createProjectBrowserDialog(window, settings) {
     let inspectorSections = [];
     let currentSortKey = savedSortKey;
     const sceneImageSession = new Soup.Session();
+    const sceneImageCleanupCallbacks = new Set();
+    let sceneImageSerial = 0;
     const previewTiles = [];
     const previewTileByPath = new Map();
     const projectSortMetadata = new Map();
@@ -1915,6 +1919,29 @@ function createProjectBrowserDialog(window, settings) {
         type: new Map(),
         contentrating: new Map(),
         tags: new Map(),
+    };
+    let dialogCleanedUp = false;
+    const dialogSettingSignalIds = [];
+
+    /*
+     * Browse-specific settings callbacks close over preview tiles, inspector
+     * widgets, Soup sessions, and native GIF paintables.  They must be scoped to
+     * this dialog instead of the parent preferences window; otherwise closing
+     * Browse leaves a settings signal as a GC root for the whole dialog state and
+     * can keep Glycin-backed paintables alive after the UI disappears.
+     */
+    const connectDialogSetting = (signal, callback) => {
+        const id = settings.connect(signal, (...args) => {
+            if (!dialogCleanedUp)
+                callback(...args);
+        });
+        dialogSettingSignalIds.push(id);
+        return id;
+    };
+
+    const disconnectDialogSettings = () => {
+        for (const id of dialogSettingSignalIds.splice(0))
+            settings.disconnect(id);
     };
 
     const previewContextMenu = createProjectPreviewContextMenu(previewWall, settings);
@@ -1931,10 +1958,65 @@ function createProjectBrowserDialog(window, settings) {
         previewWall.setTiles([]);
     };
 
-    dialog.connect('destroy', () => {
+    const describeSceneImageSource = source => {
+        const text = `${source ?? ''}`;
+        return text.length > 120 ? `${text.slice(0, 117)}...` : text;
+    };
+
+    const logSceneImageLifecycle = (id, action, image, extra = '') => {
+        console.log(
+            `Hanabi preferences: scene image #${id} ${action} ` +
+            `src="${describeSceneImageSource(image?.src)}"${extra ? ` ${extra}` : ''}`
+        );
+    };
+
+    const registerSceneImageCleanup = cleanup => {
+        sceneImageCleanupCallbacks.add(cleanup);
+        return () => sceneImageCleanupCallbacks.delete(cleanup);
+    };
+
+    const cleanupSceneImages = reason => {
+        for (const cleanup of Array.from(sceneImageCleanupCallbacks))
+            cleanup(reason);
+    };
+
+    const cleanupDialog = reason => {
+        if (dialogCleanedUp)
+            return;
+
+        dialogCleanedUp = true;
+        console.log(
+            `Hanabi preferences: Browse cleanup reason=${reason} ` +
+            `scene-images=${sceneImageCleanupCallbacks.size} ` +
+            `preview-tiles=${previewTileByPath.size}`
+        );
+        disconnectDialogSettings();
+        cleanupSceneImages(reason);
         clearPreviewTiles();
         previewQueue.destroy();
+        sceneImageSession.abort();
+    };
+
+    /*
+     * Gtk.Dialog does not guarantee that every close path reaches the same signal
+     * first: the explicit Close button emits ::response, the titlebar close button
+     * goes through GtkWindow::close-request, and widget teardown can arrive later
+     * as ::hide/::unmap/::destroy.  The cleanup itself is idempotent so whichever
+     * signal arrives first cancels remote image loads, stops native GIF paintables,
+     * and destroys the thumbnail queue before Glycin can keep decoding for a
+     * dialog that is already leaving the screen.
+     */
+    dialog.connect('response', () => {
+        cleanupDialog('response');
+        dialog.destroy();
     });
+    dialog.connect('close-request', () => {
+        cleanupDialog('close-request');
+        return false;
+    });
+    dialog.connect('hide', () => cleanupDialog('hide'));
+    dialog.connect('unmap', () => cleanupDialog('unmap'));
+    dialog.connect('destroy', () => cleanupDialog('destroy'));
 
     const getProjectSortMetadata = project => {
         let metadata = projectSortMetadata.get(project.path);
@@ -2180,7 +2262,9 @@ function createProjectBrowserDialog(window, settings) {
             label: _('Image unavailable'),
         });
         const linkUri = normalizeSceneImageLinkUri(image.href);
+        const imageId = ++sceneImageSerial;
         let destroyed = false;
+        let unregisterCleanup = null;
         const requestCancellable = new Gio.Cancellable();
         let activeNativeGifPaintable = null;
         let nativeGifSignalIds = [];
@@ -2192,6 +2276,7 @@ function createProjectBrowserDialog(window, settings) {
         box.append(spinner);
         box.append(picture);
         box.append(errorLabel);
+        logSceneImageLifecycle(imageId, 'create', image);
 
         const showError = () => {
             if (destroyed)
@@ -2230,6 +2315,7 @@ function createProjectBrowserDialog(window, settings) {
             const paintable = activeNativeGifPaintable;
             disconnectNativeGifPaintable();
             activeNativeGifPaintable = null;
+            logSceneImageLifecycle(imageId, 'stop-gif-paintable', image);
             paintable.stop?.();
         };
 
@@ -2257,6 +2343,7 @@ function createProjectBrowserDialog(window, settings) {
 
             stopNativeGifPaintable();
             activeNativeGifPaintable = paintable;
+            logSceneImageLifecycle(imageId, 'apply-gif-paintable', image);
             /*
              * Rich-media GIFs now share the same native playback path as the
              * preview wall instead of running a second GJS Gly.Loader frame
@@ -2286,14 +2373,27 @@ function createProjectBrowserDialog(window, settings) {
         };
 
         const applyImageBytes = bytes => {
+            logSceneImageLifecycle(imageId, 'apply-static-bytes', image);
             applyTexture(Gdk.Texture.new_from_bytes(bytes));
         };
 
-        box.connect('destroy', () => {
+        const cleanup = reason => {
+            if (destroyed)
+                return;
+
             destroyed = true;
+            unregisterCleanup?.();
+            unregisterCleanup = null;
+            logSceneImageLifecycle(imageId, 'cleanup', image, `reason=${reason}`);
             requestCancellable.cancel();
             stopNativeGifPaintable();
             picture.set_paintable(null);
+            spinner.visible = false;
+        };
+
+        unregisterCleanup = registerSceneImageCleanup(cleanup);
+        box.connect('destroy', () => {
+            cleanup('widget-destroy');
         });
 
         if (linkUri) {
@@ -2434,6 +2534,7 @@ function createProjectBrowserDialog(window, settings) {
     };
 
     const clearInspectorContent = () => {
+        cleanupSceneImages('inspector-clear');
         while (true) {
             const child = inspectorContent.get_first_child();
             if (!child)
@@ -2902,14 +3003,14 @@ function createProjectBrowserDialog(window, settings) {
         updateEmptyState();
     });
 
-    connectTracked(window, settings, `changed::${currentProjectKey}`, () => {
+    connectDialogSetting(`changed::${currentProjectKey}`, () => {
         syncSelectionState();
         refreshInspector();
     });
-    connectTracked(window, settings, `changed::${libraryKey}`, () => {
+    connectDialogSetting(`changed::${libraryKey}`, () => {
         rebuild();
     });
-    connectTracked(window, settings, `changed::${filterStateKey}`, () => {
+    connectDialogSetting(`changed::${filterStateKey}`, () => {
         syncFilterControls();
         rebuildPreviewTiles();
         updateEmptyState();

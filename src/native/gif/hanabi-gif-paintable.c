@@ -23,6 +23,7 @@ struct _HanabiGifPaintable
   gboolean load_pending;
   gboolean frame_pending;
   guint generation;
+  guint64 debug_id;
 
   int intrinsic_width;
   int intrinsic_height;
@@ -32,6 +33,8 @@ struct _HanabiGifPaintable
   guint64 released_frame_count;
   guint64 released_texture_count;
 };
+
+static guint64 next_paintable_debug_id = 0;
 
 static void hanabi_gif_paintable_paintable_init(GdkPaintableInterface *iface);
 
@@ -52,6 +55,12 @@ hanabi_gif_paintable_delay_to_ms(HanabiGifPaintable *self,
 
   delay_ms = (guint)((delay_us + 999) / 1000);
   return MAX(delay_ms, self->min_frame_delay_ms);
+}
+
+static gboolean
+hanabi_gif_paintable_error_is_cancelled(GError *error)
+{
+  return error != NULL && g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
 }
 
 static gboolean
@@ -196,15 +205,36 @@ hanabi_gif_paintable_next_frame_cb(GObject *source_object,
 
   self->frame_pending = FALSE;
 
-  if (!hanabi_gif_paintable_is_current(self, generation))
-    goto out;
-
+  /*
+   * Always finish the Glycin async operation, even after stop() has cancelled
+   * the shared GCancellable and advanced the generation.  Skipping _finish()
+   * leaves the loader side with an uncollected async result, which can keep the
+   * glycin-image-rs sandbox alive after the GTK widget that requested the frame
+   * has already been removed from the preferences dialog.
+   */
   new_frame = gly_image_next_frame_finish(image, result, &error);
   if (new_frame == NULL)
     {
-      if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
-        g_warning("hanabi-gif: frame load failed: %s", error->message);
+      if (hanabi_gif_paintable_error_is_cancelled(error))
+        g_message("hanabi-gif[%" G_GUINT64_FORMAT "]: frame request cancelled generation=%u",
+                  self->debug_id,
+                  generation);
+      if (!hanabi_gif_paintable_error_is_cancelled(error))
+        g_warning("hanabi-gif[%" G_GUINT64_FORMAT "]: frame load failed: %s",
+                  self->debug_id,
+                  error ? error->message : "unknown error");
       g_clear_error(&error);
+      goto out;
+    }
+
+  if (!hanabi_gif_paintable_is_current(self, generation))
+    {
+      g_message("hanabi-gif[%" G_GUINT64_FORMAT "]: releasing stale frame generation=%u current-generation=%u",
+                self->debug_id,
+                generation,
+                self->generation);
+      g_object_unref(new_frame);
+      self->released_frame_count++;
       goto out;
     }
 
@@ -238,23 +268,44 @@ hanabi_gif_paintable_load_cb(GObject *source_object,
 {
   HanabiGifPaintable *self = HANABI_GIF_PAINTABLE(user_data);
   GlyLoader *loader = GLY_LOADER(source_object);
+  GlyImage *loaded_image = NULL;
   GError *error = NULL;
   guint generation = self->generation;
 
   self->load_pending = FALSE;
 
-  if (!hanabi_gif_paintable_is_current(self, generation))
-    goto out;
-
-  self->image = gly_loader_load_finish(loader, result, &error);
-  if (self->image == NULL)
+  /*
+   * Match the frame callback: cancellation makes this paintable stale, but the
+   * async load result still belongs to Glycin and must be completed with
+   * gly_loader_load_finish() so the sandbox process can release its side of the
+   * request promptly.
+   */
+  loaded_image = gly_loader_load_finish(loader, result, &error);
+  if (loaded_image == NULL)
     {
-      if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
-        g_warning("hanabi-gif: load failed: %s", error->message);
+      if (hanabi_gif_paintable_error_is_cancelled(error))
+        g_message("hanabi-gif[%" G_GUINT64_FORMAT "]: load request cancelled generation=%u",
+                  self->debug_id,
+                  generation);
+      if (!hanabi_gif_paintable_error_is_cancelled(error))
+        g_warning("hanabi-gif[%" G_GUINT64_FORMAT "]: load failed: %s",
+                  self->debug_id,
+                  error ? error->message : "unknown error");
       g_clear_error(&error);
       goto out;
     }
 
+  if (!hanabi_gif_paintable_is_current(self, generation))
+    {
+      g_message("hanabi-gif[%" G_GUINT64_FORMAT "]: releasing stale loaded image generation=%u current-generation=%u",
+                self->debug_id,
+                generation,
+                self->generation);
+      g_object_unref(loaded_image);
+      goto out;
+    }
+
+  self->image = loaded_image;
   hanabi_gif_paintable_request_frame(self, generation);
 
 out:
@@ -286,6 +337,10 @@ hanabi_gif_paintable_start(HanabiGifPaintable *self)
           GLY_MEMORY_SELECTION_B8G8R8);
 
   self->load_pending = TRUE;
+  g_message("hanabi-gif[%" G_GUINT64_FORMAT "]: start generation=%u source=%s",
+            self->debug_id,
+            self->generation,
+            self->file != NULL ? "file" : "bytes");
   g_object_ref(self);
   gly_loader_load_async(self->loader,
                         self->cancellable,
@@ -378,6 +433,7 @@ hanabi_gif_paintable_init(HanabiGifPaintable *self)
   self->sandbox_selector = GLY_SANDBOX_SELECTOR_AUTO;
   self->initial_phase_pending = TRUE;
   self->stopped = TRUE;
+  self->debug_id = ++next_paintable_debug_id;
 }
 
 /**
@@ -446,6 +502,16 @@ void
 hanabi_gif_paintable_stop(HanabiGifPaintable *self)
 {
   g_return_if_fail(HANABI_IS_GIF_PAINTABLE(self));
+
+  g_message("hanabi-gif[%" G_GUINT64_FORMAT "]: stop generation=%u load-pending=%s frame-pending=%s frames=%" G_GUINT64_FORMAT " textures=%" G_GUINT64_FORMAT " released-frames=%" G_GUINT64_FORMAT " released-textures=%" G_GUINT64_FORMAT,
+            self->debug_id,
+            self->generation,
+            self->load_pending ? "true" : "false",
+            self->frame_pending ? "true" : "false",
+            self->frame_count,
+            self->texture_count,
+            self->released_frame_count,
+            self->released_texture_count);
 
   self->stopped = TRUE;
   self->generation++;
