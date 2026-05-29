@@ -95,6 +95,12 @@ const PROJECT_PREVIEW_WINDOW_BASE_HEIGHT = 900;
 const PROJECT_BROWSER_DIALOG_DEFAULT_WIDTH = 1280;
 const PROJECT_BROWSER_DIALOG_DEFAULT_HEIGHT = 900;
 const SCENE_PROPERTY_PANEL_WIDTH = 360;
+// Rich scene metadata can embed remote Workshop images in text-only properties
+// such as "About me". Keep those downloaded bytes in the same durable scene
+// cache root that the native renderer already uses, so reopening preferences
+// does not depend on repeated internet requests for unchanged project metadata.
+const SCENE_IMAGE_CACHE_DIR = GLib.build_filenamev([GLib.get_user_cache_dir(), 'hanabi-scene']);
+const SCENE_IMAGE_CACHE_FILE_PREFIX = 'prefs-image-';
 const INSPECTOR_ROW_HORIZONTAL_MARGIN = 24;
 const INSPECTOR_ROW_CONTROL_SPACING = 12;
 const INSPECTOR_WIDE_CONTROL_WIDTH = 180;
@@ -439,6 +445,168 @@ function isPreviewLoadCancelled(error) {
     // normal cancellation error; filtering it keeps diagnostics focused on real
     // decode or filesystem failures that still need investigation.
     return error?.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED) ?? false;
+}
+
+/**
+ * Check whether a Gio async failure is a regular cache miss.
+ *
+ * @param {Error} error Error raised by Gio.
+ * @returns {boolean} True when the error represents a missing file.
+ */
+function isFileNotFoundError(error) {
+    return error?.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND) ?? false;
+}
+
+/**
+ * Build the on-disk cache file for a remote scene metadata image.
+ *
+ * @param {string} uri Original remote image URI.
+ * @returns {Gio.File} Deterministic cache file for the URI.
+ */
+function createSceneImageCacheFile(uri) {
+    const hash = GLib.compute_checksum_for_string(GLib.ChecksumType.SHA256, uri, -1);
+    return Gio.File.new_for_path(GLib.build_filenamev([
+        SCENE_IMAGE_CACHE_DIR,
+        `${SCENE_IMAGE_CACHE_FILE_PREFIX}${hash}`,
+    ]));
+}
+
+/**
+ * Ensure the durable scene image cache directory exists.
+ *
+ * @returns {boolean} True when the cache directory can be used.
+ */
+function ensureSceneImageCacheDirectory() {
+    if (GLib.mkdir_with_parents(SCENE_IMAGE_CACHE_DIR, 0o755) === 0)
+        return true;
+
+    console.warn(`Hanabi preferences: failed to create scene image cache directory "${SCENE_IMAGE_CACHE_DIR}"`);
+    return false;
+}
+
+/**
+ * Read an entire file as GLib.Bytes without blocking GTK layout.
+ *
+ * @param {Gio.File} file File to read.
+ * @param {Gio.Cancellable} cancellable Request cancellation token.
+ * @returns {Promise<GLib.Bytes>} File payload.
+ */
+function loadBytesFromFileAsync(file, cancellable) {
+    return new Promise((resolve, reject) => {
+        file.load_bytes_async(cancellable, (source, result) => {
+            try {
+                const [bytes] = source.load_bytes_finish(result);
+                resolve(bytes);
+            } catch (e) {
+                reject(e);
+            }
+        });
+    });
+}
+
+/**
+ * Atomically replace a cache file with downloaded bytes.
+ *
+ * @param {Gio.File} file File to replace.
+ * @param {GLib.Bytes} bytes Payload to write.
+ * @param {Gio.Cancellable} cancellable Request cancellation token.
+ * @returns {Promise<void>} Resolves when the write has completed.
+ */
+function replaceFileBytesAsync(file, bytes, cancellable) {
+    return new Promise((resolve, reject) => {
+        file.replace_contents_bytes_async(
+            bytes,
+            null,
+            false,
+            Gio.FileCreateFlags.REPLACE_DESTINATION,
+            cancellable,
+            (source, result) => {
+                try {
+                    source.replace_contents_finish(result);
+                    resolve();
+                } catch (e) {
+                    reject(e);
+                }
+            }
+        );
+    });
+}
+
+/**
+ * Download a remote scene metadata image and fail on non-success HTTP statuses.
+ *
+ * @param {Soup.Session} session Shared Soup session for the preferences dialog.
+ * @param {string} uri Remote image URI.
+ * @param {Gio.Cancellable} cancellable Request cancellation token.
+ * @returns {Promise<GLib.Bytes>} Downloaded image payload.
+ */
+function downloadSceneImageBytesAsync(session, uri, cancellable) {
+    return new Promise((resolve, reject) => {
+        const message = Soup.Message.new('GET', uri);
+        session.send_and_read_async(message, GLib.PRIORITY_DEFAULT, cancellable, (source, result) => {
+            try {
+                const bytes = source.send_and_read_finish(result);
+                if (message.status_code < 200 || message.status_code >= 300)
+                    throw new Error(`HTTP ${message.status_code}`);
+
+                resolve(bytes);
+            } catch (e) {
+                reject(e);
+            }
+        });
+    });
+}
+
+/**
+ * Load remote scene metadata image bytes from ~/.cache/hanabi-scene when present.
+ *
+ * @param {Soup.Session} session Shared Soup session for cache misses.
+ * @param {string} uri Remote image URI.
+ * @param {Gio.Cancellable} cancellable Request cancellation token.
+ * @returns {Promise<GLib.Bytes>} Cached or freshly downloaded image payload.
+ */
+async function loadCachedRemoteSceneImageBytesAsync(session, uri, cancellable) {
+    const cacheFile = createSceneImageCacheFile(uri);
+    try {
+        return await loadBytesFromFileAsync(cacheFile, cancellable);
+    } catch (error) {
+        if (isPreviewLoadCancelled(error))
+            throw error;
+
+        if (!isFileNotFoundError(error)) {
+            console.warn(
+                `Hanabi preferences: failed to read cached scene image "${cacheFile.get_path()}"; ` +
+                `redownloading "${uri}": ${error}`
+            );
+        }
+    }
+
+    /*
+     * The cache is URL-addressed and intentionally content-agnostic: GTK and the
+     * native GIF paintable both sniff the downloaded bytes, so preserving file
+     * extensions or server content types would only add metadata we do not need
+     * to render the inspector. Failed cache writes are logged but non-fatal; a
+     * freshly downloaded image should still appear even when the cache directory
+     * is temporarily unavailable.
+     */
+    const bytes = await downloadSceneImageBytesAsync(session, uri, cancellable);
+    if (cancellable.is_cancelled())
+        return bytes;
+
+    if (ensureSceneImageCacheDirectory()) {
+        try {
+            await replaceFileBytesAsync(cacheFile, bytes, cancellable);
+        } catch (error) {
+            if (!isPreviewLoadCancelled(error)) {
+                console.warn(
+                    `Hanabi preferences: failed to write cached scene image "${cacheFile.get_path()}" ` +
+                    `for "${uri}": ${error}`
+                );
+            }
+        }
+    }
+
+    return bytes;
 }
 
 function readProjectPreviewStreamAsync(path, cancellable) {
@@ -2138,10 +2306,8 @@ function createProjectBrowserDialog(window, settings) {
 
         try {
             if (/^https?:\/\//i.test(image.src)) {
-                const message = Soup.Message.new('GET', image.src);
-                sceneImageSession.send_and_read_async(message, GLib.PRIORITY_DEFAULT, requestCancellable, (session, result) => {
-                    try {
-                        const bytes = session.send_and_read_finish(result);
+                loadCachedRemoteSceneImageBytesAsync(sceneImageSession, image.src, requestCancellable)
+                    .then(bytes => {
                         if (destroyed)
                             return;
 
@@ -2149,13 +2315,14 @@ function createProjectBrowserDialog(window, settings) {
                             return;
 
                         applyImageBytes(bytes);
-                    } catch (error) {
+                    })
+                    .catch(error => {
                         if (destroyed || isPreviewLoadCancelled(error))
                             return;
 
+                        console.warn(`Hanabi preferences: failed to load scene image "${image.src}": ${error}`);
                         showError();
-                    }
-                });
+                    });
             } else {
                 const file = resolveSceneImageFile(image.src);
                 if (!file) {
