@@ -2,20 +2,35 @@ import Adw from 'gi://Adw';
 import Gdk from 'gi://Gdk';
 import GdkPixbuf from 'gi://GdkPixbuf';
 import Gio from 'gi://Gio';
+import GIRepository from 'gi://GIRepository';
+import Graphene from 'gi://Graphene?version=1.0';
 import GLib from 'gi://GLib';
+import GObject from 'gi://GObject';
 import Gtk from 'gi://Gtk';
 import Pango from 'gi://Pango';
 import Soup from 'gi://Soup?version=3.0';
 
 import {gettext as _} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
+import * as BuildConfig from '../buildConfig.js';
 
-let Gly = null;
-let GlyGtk4 = null;
+const giRepository = GIRepository.Repository.dup_default();
+
+function prependRepositoryDir(path, prependFn) {
+    if (!path || !GLib.file_test(path, GLib.FileTest.IS_DIR))
+        return false;
+
+    prependFn.call(giRepository, path);
+    return true;
+}
+
+prependRepositoryDir(BuildConfig.nativeSceneTypelibDir, giRepository.prepend_search_path);
+prependRepositoryDir(BuildConfig.nativeSceneLibDir, giRepository.prepend_library_path);
+
+let HanabiGif = null;
 try {
-    Gly = (await import('gi://Gly?version=2')).default;
-    GlyGtk4 = (await import('gi://GlyGtk4?version=2')).default;
+    HanabiGif = (await import('gi://HanabiGif?version=1.0')).default;
 } catch (error) {
-    console.warn(`Hanabi preferences: animated image decoding is disabled because glycin is unavailable: ${error}`);
+    console.warn(`Hanabi preferences: native GIF preview playback is disabled because HanabiGif is unavailable: ${error}`);
 }
 
 import {
@@ -39,7 +54,7 @@ import {
     serializeStoredScenePropertyOverrides,
     setProjectFilterInSettings,
     setProjectScenePropertyOverrides,
-    setProjectWebPropertyOverrides,
+    setProjectWebPropertyOverrides
 } from '../project.js';
 import {connectTracked} from './rows.js';
 
@@ -52,12 +67,17 @@ const moduleDir = GLib.path_get_dirname(GLib.filename_from_uri(import.meta.url)[
 const extensionDir = GLib.path_get_dirname(moduleDir);
 const rendererScriptPath = GLib.build_filenamev([extensionDir, 'renderer', 'renderer.js']);
 
-const haveContentFit = Gtk.get_minor_version() >= 8;
-// The Browse grid uses compact square thumbnails so more wallpapers remain
-// visible at once, while zero child spacing removes the gutter between adjacent
-// preview cards instead of leaving GTK's default gallery-style breathing room.
-const PROJECT_CARD_WIDTH = 160;
-const PROJECT_FLOWBOX_ITEM_SPACING = 0;
+// Match the native GIF stress-test grid: square previews fill the available
+// width with no gutter, only adding a new column when the current physical tile
+// size would exceed this range on the active monitor scale.
+const PROJECT_PREVIEW_INITIAL_COLUMNS = 8;
+const PROJECT_PREVIEW_MIN_TILE_SIZE = 256;
+const PROJECT_PREVIEW_MAX_TILE_SIZE = 384;
+const PROJECT_PREVIEW_STATIC_TEXTURE_SIZE = PROJECT_PREVIEW_MAX_TILE_SIZE;
+const PROJECT_PREVIEW_MIN_FRAME_DELAY_MS = 20;
+const PROJECT_PREVIEW_START_STAGGER_MS = 25;
+const PROJECT_PREVIEW_MAX_FRAME_PHASE_MS = 48;
+const GLY_SANDBOX_SELECTOR_AUTO = 0;
 // GTK reports mouse buttons as numeric event values; naming the two buttons we
 // care about keeps card activation and thumbnail context-menu handling from
 // accidentally sharing the same all-buttons gesture.
@@ -72,6 +92,8 @@ const PROJECT_THUMBNAIL_CONCURRENCY = 3;
 // lives. On scale 2 this intentionally becomes 800x450.
 const PROJECT_PREVIEW_WINDOW_BASE_WIDTH = 1600;
 const PROJECT_PREVIEW_WINDOW_BASE_HEIGHT = 900;
+const PROJECT_BROWSER_DIALOG_DEFAULT_WIDTH = 1280;
+const PROJECT_BROWSER_DIALOG_DEFAULT_HEIGHT = 900;
 const SCENE_PROPERTY_PANEL_WIDTH = 360;
 const INSPECTOR_ROW_HORIZONTAL_MARGIN = 24;
 const INSPECTOR_ROW_CONTROL_SPACING = 12;
@@ -156,6 +178,57 @@ function queryProjectDirectorySize(path) {
     }
 
     return totalSize;
+}
+
+function sandboxSelectorFromDefault() {
+    return GLY_SANDBOX_SELECTOR_AUTO;
+}
+
+function imageSourceLooksGif(source) {
+    if (typeof source !== 'string')
+        return false;
+
+    return source.trim().toLowerCase().split(/[?#]/, 1)[0].endsWith('.gif');
+}
+
+function bytesLookLikeGif(bytes) {
+    const data = bytes?.get_data?.();
+    return data instanceof Uint8Array &&
+        data.length >= 6 &&
+        data[0] === 0x47 &&
+        data[1] === 0x49 &&
+        data[2] === 0x46 &&
+        data[3] === 0x38 &&
+        (data[4] === 0x37 || data[4] === 0x39) &&
+        data[5] === 0x61;
+}
+
+function createNativeGifPaintableForFile(file, initialPhaseMs = 0) {
+    if (!HanabiGif?.GifPaintable)
+        return null;
+
+    return HanabiGif.GifPaintable.new(
+        file,
+        PROJECT_PREVIEW_MIN_FRAME_DELAY_MS,
+        initialPhaseMs,
+        sandboxSelectorFromDefault()
+    );
+}
+
+function createNativeGifPaintableForBytes(bytes, initialPhaseMs = 0) {
+    if (!HanabiGif?.GifPaintable?.new_for_bytes)
+        return null;
+
+    return HanabiGif.GifPaintable.new_for_bytes(
+        bytes,
+        PROJECT_PREVIEW_MIN_FRAME_DELAY_MS,
+        initialPhaseMs,
+        sandboxSelectorFromDefault()
+    );
+}
+
+function projectPreviewIsGif(path) {
+    return imageSourceLooksGif(path);
 }
 
 function normalizeProjectBrowserSortKey(key) {
@@ -257,7 +330,7 @@ export function formatProjectSubtitle(path) {
 
     const title = typeof project.title === 'string' && project.title !== ''
         ? project.title
-        : (project.basename || path);
+        : project.basename || path;
     return `${title} (${formatProjectTypeLabel(project.type)})`;
 }
 
@@ -312,9 +385,9 @@ export function prefsRowLibraryPath(window, prefsGroup) {
     });
 
     connectTracked(window, settings, `changed::${key}`, () => {
-        const path = settings.get_string(key);
-        const normalized = normalizeLibraryRootPath(path);
-        if (normalized !== path) {
+        const nextPath = settings.get_string(key);
+        const normalized = normalizeLibraryRootPath(nextPath);
+        if (normalized !== nextPath) {
             settings.set_string(key, normalized);
             return;
         }
@@ -328,7 +401,7 @@ function buildProjectSearchText(project) {
         project.basename,
         project.type,
         project.description,
-        ...(project.tags ?? []),
+        ...project.tags ?? [],
     ].join(' ').toLowerCase();
 }
 
@@ -409,38 +482,13 @@ async function loadProjectPreviewPixbufAsync(path, cancellable) {
             // while every project card was being created.
             GdkPixbuf.Pixbuf.new_from_stream_at_scale_async(
                 stream,
-                PROJECT_CARD_WIDTH,
-                PROJECT_CARD_WIDTH,
+                PROJECT_PREVIEW_STATIC_TEXTURE_SIZE,
+                PROJECT_PREVIEW_STATIC_TEXTURE_SIZE,
                 true,
                 cancellable,
                 (_source, result) => {
                     try {
                         resolve(GdkPixbuf.Pixbuf.new_from_stream_finish(result));
-                    } catch (e) {
-                        reject(e);
-                    }
-                }
-            );
-        });
-    } finally {
-        await closePreviewStreamQuietlyAsync(stream);
-    }
-}
-
-async function loadProjectPreviewAnimationAsync(path, cancellable) {
-    let stream = null;
-    try {
-        stream = await readProjectPreviewStreamAsync(path, cancellable);
-        return await new Promise((resolve, reject) => {
-            // GIF previews still keep their animation support, but the animation
-            // container is opened asynchronously so large workshop libraries do
-            // not freeze preferences while the first frame is decoded.
-            GdkPixbuf.PixbufAnimation.new_from_stream_async(
-                stream,
-                cancellable,
-                (_source, result) => {
-                    try {
-                        resolve(GdkPixbuf.PixbufAnimation.new_from_stream_finish(result));
                     } catch (e) {
                         reject(e);
                     }
@@ -525,198 +573,456 @@ function createProjectPreviewLoadQueue() {
     };
 }
 
-function createProjectPreviewFrame() {
-    const frame = new Gtk.Overlay({
-        hexpand: false,
-        vexpand: false,
-    });
-    frame.set_size_request(PROJECT_CARD_WIDTH, PROJECT_CARD_WIDTH);
-
-    const placeholder = new Gtk.Box({
-        hexpand: false,
-        vexpand: false,
-        css_classes: ['card'],
-    });
-    placeholder.set_size_request(PROJECT_CARD_WIDTH, PROJECT_CARD_WIDTH);
-    frame.set_child(placeholder);
-
-    const picture = new Gtk.Picture({
-        hexpand: false,
-        vexpand: false,
-        can_shrink: true,
-        visible: false,
-    });
-    picture.set_size_request(PROJECT_CARD_WIDTH, PROJECT_CARD_WIDTH);
-    if (haveContentFit)
-        picture.set_content_fit(Gtk.ContentFit.COVER);
-    frame.add_overlay(picture);
-
-    const spinner = new Gtk.Spinner({
-        spinning: false,
-        halign: Gtk.Align.CENTER,
-        valign: Gtk.Align.CENTER,
-        visible: false,
-    });
-    frame.add_overlay(spinner);
-
-    return {frame, picture, spinner};
-}
-
-function attachAnimatedProjectPreview(picture, animation, isCancelled) {
-    const iter = animation.get_iter(null);
-    let timerId = 0;
-
-    const updateFrame = () => {
-        if (isCancelled())
-            return GLib.SOURCE_REMOVE;
-
-        const pixbuf = iter.get_pixbuf();
-        if (pixbuf) {
-            // Hover playback must not retain a texture per GIF frame. Keeping
-            // only the currently painted frame gives the browser a bounded
-            // lifetime for animation resources: enter creates them, leave
-            // releases them, and normal grid browsing stays static.
-            const scaled = pixbuf.scale_simple(
-                PROJECT_CARD_WIDTH,
-                PROJECT_CARD_WIDTH,
-                GdkPixbuf.InterpType.BILINEAR
-            ) ?? pixbuf;
-            picture.set_paintable(Gdk.Texture.new_for_pixbuf(scaled));
-        }
-
-        const delay = iter.get_delay_time();
-        if (delay < 0)
-            return GLib.SOURCE_REMOVE;
-
-        timerId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, Math.max(delay, 16), () => {
-            timerId = 0;
-            if (isCancelled())
-                return GLib.SOURCE_REMOVE;
-
-            iter.advance(null);
-            return updateFrame();
-        });
-        return GLib.SOURCE_REMOVE;
-    };
-
-    updateFrame();
-    return () => {
-        if (timerId) {
-            GLib.source_remove(timerId);
-            timerId = 0;
-        }
-        picture.set_paintable(null);
-    };
-}
-
-function createProjectPreview(project, previewQueue) {
-    const {frame, picture, spinner} = createProjectPreviewFrame();
-    if (!project.previewPath || !previewQueue)
-        return frame;
-
-    let destroyed = false;
-    let cancelLoad = null;
-    let cancelAnimationLoad = null;
-    let animationLoadToken = 0;
-    let stopAnimation = null;
-    let staticTexture = null;
-    let hoverActive = false;
-    const path = project.previewPath;
-    const isGif = path.toLowerCase().endsWith('.gif');
-
-    const finishLoading = () => {
-        spinner.spinning = false;
-        spinner.visible = false;
-    };
-
-    const failLoading = error => {
-        if (destroyed)
-            return;
-
-        finishLoading();
-        if (!isPreviewLoadCancelled(error))
-            console.warn(`Hanabi preferences: failed to load wallpaper thumbnail "${path}": ${error}`);
-    };
-
-    const stopHoverAnimation = () => {
-        animationLoadToken++;
-        cancelAnimationLoad?.();
-        cancelAnimationLoad = null;
-        stopAnimation?.();
-        stopAnimation = null;
-        if (staticTexture)
-            picture.set_paintable(staticTexture);
-    };
-
-    const startHoverAnimation = () => {
-        if (!isGif || destroyed || !hoverActive || stopAnimation || cancelAnimationLoad)
-            return;
-
-        const loadToken = ++animationLoadToken;
-        cancelAnimationLoad = previewQueue.enqueue(async cancellable => {
-            try {
-                const animation = await loadProjectPreviewAnimationAsync(path, cancellable);
-                if (destroyed || cancellable.is_cancelled() || !hoverActive || loadToken !== animationLoadToken)
-                    return;
-
-                stopAnimation = attachAnimatedProjectPreview(
-                    picture,
-                    animation,
-                    () => destroyed || !hoverActive || loadToken !== animationLoadToken
-                );
-                picture.visible = true;
-            } catch (error) {
-                if (!isPreviewLoadCancelled(error))
-                    console.warn(`Hanabi preferences: failed to play wallpaper GIF thumbnail "${path}": ${error}`);
-            } finally {
-                if (loadToken === animationLoadToken)
-                    cancelAnimationLoad = null;
-            }
-        });
-    };
-
-    spinner.visible = true;
-    spinner.spinning = true;
-    cancelLoad = previewQueue.enqueue(async cancellable => {
-        try {
-            const pixbuf = await loadProjectPreviewPixbufAsync(path, cancellable);
-            if (destroyed || cancellable.is_cancelled())
-                return;
-
-            staticTexture = Gdk.Texture.new_for_pixbuf(pixbuf);
-            if (!hoverActive || !stopAnimation)
-                picture.set_paintable(staticTexture);
-            picture.visible = true;
-            finishLoading();
-            startHoverAnimation();
-        } catch (error) {
-            failLoading(error);
-        }
-    });
-
-    if (isGif) {
-        const hoverController = new Gtk.EventControllerMotion();
-        hoverController.connect('enter', () => {
-            hoverActive = true;
-            startHoverAnimation();
-        });
-        hoverController.connect('leave', () => {
-            hoverActive = false;
-            stopHoverAnimation();
-        });
-        frame.add_controller(hoverController);
+class SourceBag {
+    constructor() {
+        this._ids = new Set();
     }
 
-    frame.connect('destroy', () => {
-        destroyed = true;
-        cancelLoad?.();
-        stopHoverAnimation();
-        finishLoading();
-        picture.set_paintable(null);
-    });
+    add(id) {
+        if (id)
+            this._ids.add(id);
+        return id;
+    }
 
-    return frame;
+    forget(id) {
+        if (id)
+            this._ids.delete(id);
+    }
+
+    clear() {
+        for (const id of this._ids)
+            GLib.source_remove(id);
+        this._ids.clear();
+    }
 }
+
+class AdaptiveTileLayout {
+    constructor(minTileSize, maxTileSize) {
+        this._minTileSize = minTileSize;
+        this._maxTileSize = Math.max(minTileSize, maxTileSize);
+    }
+
+    get minTileSize() {
+        return this._minTileSize;
+    }
+
+    get maxTileSize() {
+        return this._maxTileSize;
+    }
+
+    getMinLogicalTileSize(scaleFactor) {
+        return this._logicalThresholds(scaleFactor).minTileSize;
+    }
+
+    compute(viewportWidth, itemCount, fallbackColumns, currentLayout = null, scaleFactor = 1) {
+        const thresholds = this._logicalThresholds(scaleFactor);
+
+        if (itemCount <= 0)
+            return this._createLayout(1, thresholds.minTileSize, thresholds);
+
+        if (viewportWidth <= 0) {
+            const columns = Math.max(1, fallbackColumns);
+            return this._createLayout(columns, thresholds.minTileSize, thresholds);
+        }
+
+        /*
+         * This is intentionally the same layout contract as the standalone GIF
+         * wall: GTK measures in logical pixels, while the knobs are physical
+         * preview sizes. Existing columns are kept while still inside the range
+         * so scrollbar and resize jitter do not cause constant grid reshuffles.
+         */
+        let columns = 0;
+        if (currentLayout !== null && currentLayout.scaleFactor === thresholds.scaleFactor) {
+            const currentColumns = Math.max(1, currentLayout.columns);
+            const currentTileSize = viewportWidth / currentColumns;
+            if (currentTileSize >= thresholds.minTileSize && currentTileSize <= thresholds.maxTileSize)
+                return this._createLayout(currentColumns, Math.max(1, currentTileSize), thresholds);
+
+            columns = currentTileSize > thresholds.maxTileSize
+                ? Math.ceil(viewportWidth / thresholds.maxTileSize)
+                : Math.floor(viewportWidth / thresholds.minTileSize);
+        }
+
+        if (columns <= 0)
+            columns = Math.ceil(viewportWidth / thresholds.maxTileSize);
+
+        const boundedColumns = Math.max(1, columns);
+        const tileSize = Math.max(1, viewportWidth / boundedColumns);
+        return this._createLayout(boundedColumns, tileSize, thresholds);
+    }
+
+    _logicalThresholds(scaleFactor) {
+        const normalizedScaleFactor = Number.isFinite(scaleFactor) && scaleFactor > 0 ? scaleFactor : 1;
+        const minTileSize = Math.max(1, Math.ceil(this._minTileSize / normalizedScaleFactor));
+        const maxTileSize = Math.max(minTileSize, Math.floor(this._maxTileSize / normalizedScaleFactor));
+        return {
+            scaleFactor: normalizedScaleFactor,
+            minTileSize,
+            maxTileSize,
+        };
+    }
+
+    _createLayout(columns, tileSize, thresholds) {
+        return {
+            columns,
+            tileSize,
+            scaleFactor: thresholds.scaleFactor,
+            minLogicalTileSize: thresholds.minTileSize,
+            maxLogicalTileSize: thresholds.maxTileSize,
+        };
+    }
+}
+
+class ProjectPreviewTile {
+    constructor(project, previewQueue, onPaintableChanged = null) {
+        this.project = project;
+        this._previewQueue = previewQueue;
+        this._onPaintableChanged = onPaintableChanged;
+        this._sources = new SourceBag();
+        this._paintable = null;
+        this._cancelLoad = null;
+        this._loadToken = 0;
+        this._startedUsec = 0;
+        this._visibleIndex = 0;
+        this._started = false;
+    }
+
+    get paintable() {
+        return this._paintable;
+    }
+
+    get isGif() {
+        return projectPreviewIsGif(this.project.previewPath);
+    }
+
+    ensureStarted(visibleIndex, delayMs = 0) {
+        this._visibleIndex = visibleIndex;
+        if (this._started)
+            return;
+
+        this.start(delayMs);
+    }
+
+    start(delayMs = 0) {
+        this.stop();
+        this._started = true;
+
+        if (!this.project.previewPath)
+            return;
+
+        if (delayMs <= 0) {
+            this._startNow();
+            return;
+        }
+
+        const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, Math.round(delayMs), () => {
+            this._sources.forget(id);
+            this._startNow();
+            return GLib.SOURCE_REMOVE;
+        });
+        this._sources.add(id);
+    }
+
+    stop() {
+        this._sources.clear();
+        this._cancelLoad?.();
+        this._cancelLoad = null;
+        this._loadToken++;
+
+        if (this._paintable !== null) {
+            const paintable = this._paintable;
+            this._paintable = null;
+
+            if (this.isGif && paintable.stop)
+                paintable.stop();
+
+            this._notifyPaintableChanged();
+        }
+
+        this._startedUsec = 0;
+        this._started = false;
+    }
+
+    _startNow() {
+        if (!this.project.previewPath)
+            return;
+
+        if (this.isGif && HanabiGif?.GifPaintable) {
+            this._startedUsec = GLib.get_monotonic_time();
+            this._paintable = createNativeGifPaintableForFile(
+                Gio.File.new_for_path(this.project.previewPath),
+                this._computeFramePhaseMs(this._visibleIndex)
+            );
+            this._notifyPaintableChanged();
+            return;
+        }
+
+        this._loadStaticTexture();
+    }
+
+    _loadStaticTexture() {
+        const path = this.project.previewPath;
+        if (!path || !this._previewQueue)
+            return;
+
+        const loadToken = ++this._loadToken;
+        this._cancelLoad = this._previewQueue.enqueue(async cancellable => {
+            try {
+                const pixbuf = await loadProjectPreviewPixbufAsync(path, cancellable);
+                if (cancellable.is_cancelled() || loadToken !== this._loadToken)
+                    return;
+
+                this._paintable = Gdk.Texture.new_for_pixbuf(pixbuf);
+                this._notifyPaintableChanged();
+            } catch (error) {
+                if (!isPreviewLoadCancelled(error))
+                    console.warn(`Hanabi preferences: failed to load wallpaper thumbnail "${path}": ${error}`);
+            } finally {
+                if (loadToken === this._loadToken)
+                    this._cancelLoad = null;
+            }
+        });
+    }
+
+    _computeFramePhaseMs(index) {
+        if (PROJECT_PREVIEW_MAX_FRAME_PHASE_MS <= 1)
+            return 0;
+
+        return (index * 13) % PROJECT_PREVIEW_MAX_FRAME_PHASE_MS;
+    }
+
+    _notifyPaintableChanged() {
+        this._onPaintableChanged?.(this);
+    }
+}
+
+const ProjectPreviewWall = GObject.registerClass(
+class ProjectPreviewWall extends Gtk.Widget {
+    _init(layout, fallbackColumns) {
+        super._init({
+            hexpand: true,
+            vexpand: false,
+            overflow: Gtk.Overflow.HIDDEN,
+        });
+
+        this._layout = layout;
+        this._fallbackColumns = fallbackColumns;
+        this._tiles = [];
+        this._lastLayout = null;
+        this._lastLoggedLayoutKey = '';
+        this._paintableSignalIds = new Map();
+        this._selectedPath = '';
+        this._onActivate = null;
+        this._onContextMenu = null;
+        this._tileOffset = new Graphene.Point();
+        this._tileBounds = new Graphene.Rect();
+        this._selectionRects = Array.from({length: 4}, () => new Graphene.Rect());
+        this._placeholderColor = new Gdk.RGBA({red: 0.20, green: 0.20, blue: 0.20, alpha: 0.28});
+        this._selectedColor = new Gdk.RGBA({red: 0.20, green: 0.48, blue: 0.95, alpha: 0.92});
+
+        const primaryGesture = new Gtk.GestureClick({button: PROJECT_CARD_PRIMARY_BUTTON});
+        primaryGesture.connect('released', (_gesture, _nPress, x, y) => {
+            const tile = this.tileAt(x, y);
+            if (tile)
+                this._onActivate?.(tile.project);
+        });
+        this.add_controller(primaryGesture);
+
+        const secondaryGesture = new Gtk.GestureClick({button: PROJECT_CARD_SECONDARY_BUTTON});
+        secondaryGesture.connect('pressed', (_gesture, _nPress, x, y) => {
+            const tile = this.tileAt(x, y);
+            if (tile)
+                this._onContextMenu?.(tile.project, x, y);
+        });
+        this.add_controller(secondaryGesture);
+
+        this.connect('notify::scale-factor', () => {
+            this._lastLayout = null;
+            this._lastLoggedLayoutKey = '';
+            this.queue_resize();
+            this.queue_draw();
+        });
+    }
+
+    setCallbacks(onActivate, onContextMenu) {
+        this._onActivate = onActivate;
+        this._onContextMenu = onContextMenu;
+    }
+
+    setTiles(tiles) {
+        this._disconnectPaintables();
+        this._tiles = tiles;
+        this.syncPaintables();
+        this.queue_resize();
+        this.queue_draw();
+    }
+
+    setSelectedPath(path) {
+        this._selectedPath = path ?? '';
+        this.queue_draw();
+    }
+
+    syncPaintables() {
+        const activePaintables = new Set();
+
+        /*
+         * Every animated GIF invalidates one native paintable. The wall keeps
+         * those signal connections centralized so each frame redraws this
+         * single widget instead of waking a full tree of Gtk.Picture children.
+         */
+        for (const tile of this._tiles) {
+            const paintable = tile.paintable;
+            if (paintable === null)
+                continue;
+
+            activePaintables.add(paintable);
+            if (this._paintableSignalIds.has(paintable))
+                continue;
+
+            const contentsId = paintable.connect('invalidate-contents', () => this.queue_draw());
+            const sizeId = paintable.connect('invalidate-size', () => {
+                this.queue_resize();
+                this.queue_draw();
+            });
+            this._paintableSignalIds.set(paintable, [contentsId, sizeId]);
+        }
+
+        for (const [paintable, signalIds] of Array.from(this._paintableSignalIds.entries())) {
+            if (activePaintables.has(paintable))
+                continue;
+
+            for (const signalId of signalIds)
+                paintable.disconnect(signalId);
+            this._paintableSignalIds.delete(paintable);
+        }
+    }
+
+    tileAt(x, y) {
+        const layout = this._computeLayoutForWidth(this.get_width());
+        if (layout.tileSize <= 0)
+            return null;
+
+        const column = Math.floor(x / layout.tileSize);
+        const row = Math.floor(y / layout.tileSize);
+        if (column < 0 || column >= layout.columns || row < 0)
+            return null;
+
+        const index = row * layout.columns + column;
+        return this._tiles[index] ?? null;
+    }
+
+    vfunc_get_request_mode() {
+        return Gtk.SizeRequestMode.HEIGHT_FOR_WIDTH;
+    }
+
+    vfunc_measure(orientation, forSize) {
+        const scaleFactor = this._getScaleFactor();
+        const minLogicalTileSize = this._layout.getMinLogicalTileSize(scaleFactor);
+
+        if (orientation === Gtk.Orientation.HORIZONTAL) {
+            const naturalColumns = Math.max(1, Math.min(this._tiles.length || 1, this._fallbackColumns));
+            const naturalWidth = naturalColumns * minLogicalTileSize;
+            return [minLogicalTileSize, naturalWidth, -1, -1];
+        }
+
+        const width = forSize > 0 ? forSize : this._fallbackColumns * minLogicalTileSize;
+        const layout = this._layout.compute(
+            width,
+            this._tiles.length,
+            this._fallbackColumns,
+            this._lastLayout,
+            scaleFactor
+        );
+        const rows = Math.max(1, Math.ceil(this._tiles.length / layout.columns));
+        const height = Math.ceil(rows * layout.tileSize);
+        return [height, height, -1, -1];
+    }
+
+    vfunc_snapshot(snapshot) {
+        const layout = this._computeLayoutForWidth(this.get_width());
+        this._lastLayout = layout;
+        this._logLayoutChange(this.get_width(), layout);
+
+        this._tiles.forEach((tile, index) => {
+            const column = index % layout.columns;
+            const row = Math.floor(index / layout.columns);
+            const x = column * layout.tileSize;
+            const y = row * layout.tileSize;
+
+            snapshot.save();
+            this._tileOffset.init(x, y);
+            snapshot.translate(this._tileOffset);
+
+            if (tile.paintable)
+                tile.paintable.snapshot(snapshot, layout.tileSize, layout.tileSize);
+            else
+                this._appendTilePlaceholder(snapshot, layout.tileSize);
+
+            if (tile.project.path === this._selectedPath)
+                this._appendSelectionBorder(snapshot, layout.tileSize);
+
+            snapshot.restore();
+        });
+    }
+
+    _computeLayoutForWidth(width) {
+        return this._layout.compute(
+            width,
+            this._tiles.length,
+            this._fallbackColumns,
+            this._lastLayout,
+            this._getScaleFactor()
+        );
+    }
+
+    _appendTilePlaceholder(snapshot, tileSize) {
+        this._tileBounds.init(0, 0, tileSize, tileSize);
+        snapshot.append_color(this._placeholderColor, this._tileBounds);
+    }
+
+    _appendSelectionBorder(snapshot, tileSize) {
+        const thickness = Math.max(2, Math.round(3 / this._getScaleFactor()));
+        this._selectionRects[0].init(0, 0, tileSize, thickness);
+        this._selectionRects[1].init(0, tileSize - thickness, tileSize, thickness);
+        this._selectionRects[2].init(0, 0, thickness, tileSize);
+        this._selectionRects[3].init(tileSize - thickness, 0, thickness, tileSize);
+
+        for (const rect of this._selectionRects)
+            snapshot.append_color(this._selectedColor, rect);
+    }
+
+    _disconnectPaintables() {
+        for (const [paintable, signalIds] of this._paintableSignalIds) {
+            for (const signalId of signalIds)
+                paintable.disconnect(signalId);
+        }
+        this._paintableSignalIds.clear();
+    }
+
+    _logLayoutChange(width, layout) {
+        const physicalTileSize = layout.tileSize * layout.scaleFactor;
+        const key = `${width}:${layout.columns}:${layout.tileSize}:${layout.scaleFactor}`;
+        if (key === this._lastLoggedLayoutKey)
+            return;
+
+        this._lastLoggedLayoutKey = key;
+        console.log(
+            `Hanabi preferences: preview-layout width=${width} columns=${layout.columns} ` +
+            `tile_size_logical=${layout.tileSize.toFixed(2)} ` +
+            `tile_size_physical=${physicalTileSize.toFixed(2)} ` +
+            `scale_factor=${layout.scaleFactor} ` +
+            `min_tile_size_physical=${this._layout.minTileSize} ` +
+            `max_tile_size_physical=${this._layout.maxTileSize} ` +
+            `min_tile_size_logical=${layout.minLogicalTileSize} ` +
+            `max_tile_size_logical=${layout.maxLogicalTileSize} gap=0`
+        );
+    }
+
+    _getScaleFactor() {
+        const scaleFactor = this.get_scale_factor();
+        return Number.isFinite(scaleFactor) && scaleFactor > 0 ? scaleFactor : 1;
+    }
+});
 
 function openProjectDirectory(project) {
     const path = project?.path;
@@ -807,16 +1113,17 @@ function launchProjectPreview(project, windowed, anchorWidget = null, settings =
     }
 }
 
-function attachProjectPreviewContextMenu(preview, project, settings) {
+function createProjectPreviewContextMenu(preview, settings) {
     const actions = new Gio.SimpleActionGroup();
+    let currentProject = null;
     const openFolderAction = new Gio.SimpleAction({name: 'open-folder'});
-    openFolderAction.connect('activate', () => openProjectDirectory(project));
+    openFolderAction.connect('activate', () => openProjectDirectory(currentProject));
     actions.add_action(openFolderAction);
     const previewWindowAction = new Gio.SimpleAction({name: 'preview-window'});
-    previewWindowAction.connect('activate', () => launchProjectPreview(project, true, preview, settings));
+    previewWindowAction.connect('activate', () => launchProjectPreview(currentProject, true, preview, settings));
     actions.add_action(previewWindowAction);
     const previewFullscreenAction = new Gio.SimpleAction({name: 'preview-fullscreen'});
-    previewFullscreenAction.connect('activate', () => launchProjectPreview(project, false, null, settings));
+    previewFullscreenAction.connect('activate', () => launchProjectPreview(currentProject, false, null, settings));
     actions.add_action(previewFullscreenAction);
     preview.insert_action_group('thumbnail', actions);
 
@@ -830,84 +1137,27 @@ function attachProjectPreviewContextMenu(preview, project, settings) {
     menu.append_submenu(_('Preview'), previewMenu);
     menu.append(_('Open Wallpaper Folder'), 'thumbnail.open-folder');
 
-    // The popover is parented to the thumbnail widget so the menu is only
-    // available from right-clicking the preview image, not the title/subtitle
-    // labels below the card.
     const popover = Gtk.PopoverMenu.new_from_model(menu);
     popover.set_parent(preview);
     preview.connect('destroy', () => popover.unparent());
 
-    const contextGesture = new Gtk.GestureClick({button: PROJECT_CARD_SECONDARY_BUTTON});
-    contextGesture.connect('pressed', (_gesture, _nPress, x, y) => {
-        // Pointing the popover at the click position makes the context menu feel
-        // anchored to the exact thumbnail spot the user right-clicked.
-        popover.set_pointing_to(new Gdk.Rectangle({
-            x: Math.round(x),
-            y: Math.round(y),
-            width: 1,
-            height: 1,
-        }));
-        popover.popup();
-    });
-    preview.add_controller(contextGesture);
-}
+    return {
+        popup(project, x, y) {
+            if (!project)
+                return;
 
-function createProjectCard(project, onActivate, previewQueue, settings) {
-    const titleText = typeof project.title === 'string' && project.title !== ''
-        ? project.title
-        : (project.basename || _('Untitled'));
-
-    const root = new Gtk.Box({
-        orientation: Gtk.Orientation.VERTICAL,
-        spacing: 8,
-        hexpand: false,
-        width_request: PROJECT_CARD_WIDTH,
-        halign: Gtk.Align.START,
-        valign: Gtk.Align.START,
-        tooltip_text: project.path,
-    });
-
-    const preview = createProjectPreview(project, previewQueue);
-    preview.set({
-        hexpand: false,
-        vexpand: false,
-    });
-    preview.set_size_request(PROJECT_CARD_WIDTH, PROJECT_CARD_WIDTH);
-    attachProjectPreviewContextMenu(preview, project, settings);
-
-    const subtitleParts = [formatProjectTypeLabel(project.type)];
-    if (project.tags?.length)
-        subtitleParts.push(formatProjectGenreLabel(project.tags[0]));
-
-    const title = new Gtk.Label({
-        label: titleText,
-        xalign: 0,
-        wrap: false,
-        max_width_chars: 18,
-        ellipsize: Pango.EllipsizeMode.END,
-        css_classes: ['heading'],
-    });
-
-    const subtitle = new Gtk.Label({
-        label: subtitleParts.join(' • '),
-        xalign: 0,
-        wrap: false,
-        max_width_chars: 18,
-        ellipsize: Pango.EllipsizeMode.END,
-        css_classes: ['dim-label'],
-    });
-
-    root.append(preview);
-    root.append(title);
-    root.append(subtitle);
-
-    // Keep selection on the primary button only, leaving the secondary button
-    // free for thumbnail context-menu actions without also activating the card.
-    const gesture = new Gtk.GestureClick({button: PROJECT_CARD_PRIMARY_BUTTON});
-    gesture.connect('released', () => onActivate(project));
-    root.add_controller(gesture);
-
-    return root;
+            currentProject = project;
+            // Pointing the popover at the exact tile position preserves the old
+            // right-click behavior even though the grid is now one custom widget.
+            popover.set_pointing_to(new Gdk.Rectangle({
+                x: Math.round(x),
+                y: Math.round(y),
+                width: 1,
+                height: 1,
+            }));
+            popover.popup();
+        },
+    };
 }
 
 function stripScenePropertyMarkup(text) {
@@ -1272,8 +1522,8 @@ function createProjectBrowserDialog(window, settings) {
         title: _('Choose Wallpaper'),
         transient_for: window,
         modal: true,
-        default_width: 1120,
-        default_height: 760,
+        default_width: PROJECT_BROWSER_DIALOG_DEFAULT_WIDTH,
+        default_height: PROJECT_BROWSER_DIALOG_DEFAULT_HEIGHT,
     });
     dialog.add_button(_('Close'), Gtk.ResponseType.CLOSE);
     dialog.connect('response', () => dialog.destroy());
@@ -1319,8 +1569,8 @@ function createProjectBrowserDialog(window, settings) {
         placeholder_text: _('Search wallpapers'),
     });
     // Keep Browse sorting as a dialog-local view choice: it should reorder the
-    // currently loaded cards without changing the shared project loader order
-    // that renderer-side rotation and other callers may still depend on.
+    // currently visible preview wall without changing the shared project loader
+    // order that renderer-side rotation and other callers may still depend on.
     const sortOptions = [
         {key: PROJECT_BROWSER_SORT_KEYS.NAME, label: _('Name')},
         {key: PROJECT_BROWSER_SORT_KEYS.FILE_SIZE, label: _('File size')},
@@ -1415,26 +1665,12 @@ function createProjectBrowserDialog(window, settings) {
         hexpand: true,
         vexpand: true,
     });
-    const flowBox = new Gtk.FlowBox({
-        selection_mode: Gtk.SelectionMode.NONE,
-        column_spacing: PROJECT_FLOWBOX_ITEM_SPACING,
-        row_spacing: PROJECT_FLOWBOX_ITEM_SPACING,
-        min_children_per_line: 1,
-        max_children_per_line: 6,
-        hexpand: true,
-        valign: Gtk.Align.START,
-        homogeneous: false,
-        // Keep the outer edge gap matched to the internal gap so the compact
-        // wallpaper grid has no leftover border padding around the first or
-        // last preview card.
-        margin_top: PROJECT_FLOWBOX_ITEM_SPACING,
-        margin_bottom: PROJECT_FLOWBOX_ITEM_SPACING,
-        margin_start: PROJECT_FLOWBOX_ITEM_SPACING,
-        margin_end: PROJECT_FLOWBOX_ITEM_SPACING,
-    });
-    flowBox.set_homogeneous(false);
-    flowBox.set_selection_mode(Gtk.SelectionMode.NONE);
-    scrolled.set_child(flowBox);
+    const previewLayout = new AdaptiveTileLayout(
+        PROJECT_PREVIEW_MIN_TILE_SIZE,
+        PROJECT_PREVIEW_MAX_TILE_SIZE
+    );
+    const previewWall = new ProjectPreviewWall(previewLayout, PROJECT_PREVIEW_INITIAL_COLUMNS);
+    scrolled.set_child(previewWall);
     browserPane.append(scrolled);
 
     const placeholder = new Gtk.Label({
@@ -1499,7 +1735,8 @@ function createProjectBrowserDialog(window, settings) {
     let inspectorSections = [];
     let currentSortKey = savedSortKey;
     const sceneImageSession = new Soup.Session();
-    const cards = [];
+    const previewTiles = [];
+    const previewTileByPath = new Map();
     const projectSortMetadata = new Map();
     // The Browse dialog owns one thumbnail queue. Destroying the dialog cancels
     // pending preview IO and prevents late async callbacks from touching widgets
@@ -1512,7 +1749,24 @@ function createProjectBrowserDialog(window, settings) {
         tags: new Map(),
     };
 
-    dialog.connect('destroy', () => previewQueue.destroy());
+    const previewContextMenu = createProjectPreviewContextMenu(previewWall, settings);
+    previewWall.setCallbacks(project => {
+        settings.set_string(currentProjectKey, project.path);
+        syncSelectionState();
+        buildInspector(project);
+    }, (project, x, y) => previewContextMenu.popup(project, x, y));
+
+    const clearPreviewTiles = () => {
+        previewTileByPath.forEach(tile => tile.stop());
+        previewTileByPath.clear();
+        previewTiles.length = 0;
+        previewWall.setTiles([]);
+    };
+
+    dialog.connect('destroy', () => {
+        clearPreviewTiles();
+        previewQueue.destroy();
+    });
 
     const getProjectSortMetadata = project => {
         let metadata = projectSortMetadata.get(project.path);
@@ -1759,8 +2013,9 @@ function createProjectBrowserDialog(window, settings) {
         });
         const linkUri = normalizeSceneImageLinkUri(image.href);
         let destroyed = false;
-        let animationTimerId = 0;
-        let activeImage = null;
+        const requestCancellable = new Gio.Cancellable();
+        let activeNativeGifPaintable = null;
+        let nativeGifSignalIds = [];
 
         picture.set_size_request(
             Math.min(image.width ?? maxWidth, maxWidth),
@@ -1791,80 +2046,85 @@ function createProjectBrowserDialog(window, settings) {
             picture.set_paintable(paintable);
         };
 
+        const disconnectNativeGifPaintable = () => {
+            if (activeNativeGifPaintable === null)
+                return;
+
+            for (const signalId of nativeGifSignalIds)
+                activeNativeGifPaintable.disconnect(signalId);
+            nativeGifSignalIds = [];
+        };
+
+        const stopNativeGifPaintable = () => {
+            if (activeNativeGifPaintable === null)
+                return;
+
+            const paintable = activeNativeGifPaintable;
+            disconnectNativeGifPaintable();
+            activeNativeGifPaintable = null;
+            paintable.stop?.();
+        };
+
         const applyTexture = texture => {
+            stopNativeGifPaintable();
             applyPaintable(texture, texture.get_width(), texture.get_height());
         };
 
-        const clearAnimationTimer = () => {
-            if (!animationTimerId)
-                return;
-
-            GLib.source_remove(animationTimerId);
-            animationTimerId = 0;
+        const updateNativeGifSize = paintable => {
+            const intrinsicWidth = paintable.get_intrinsic_width?.() ?? 0;
+            const intrinsicHeight = paintable.get_intrinsic_height?.() ?? 0;
+            const naturalWidth = intrinsicWidth > 0 ? intrinsicWidth : image.width ?? maxWidth;
+            const naturalHeight = intrinsicHeight > 0 ? intrinsicHeight : image.height ?? naturalWidth;
+            applyPaintable(paintable, naturalWidth, naturalHeight);
         };
 
-        const playGlyImageFrame = imageHandle => {
-            if (destroyed)
-                return;
+        const applyNativeGifPaintable = paintable => {
+            if (paintable === null)
+                return false;
 
-            imageHandle.next_frame_async(null, (source, result) => {
-                if (destroyed)
-                    return;
+            if (destroyed) {
+                paintable.stop?.();
+                return false;
+            }
 
-                try {
-                    const frame = source.next_frame_finish(result);
-                    applyTexture(GlyGtk4.frame_get_texture(frame));
-
-                    const delayMs = Math.round(frame.get_delay() / 1000);
-                    if (delayMs <= 0)
-                        return;
-
-                    clearAnimationTimer();
-                    animationTimerId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, Math.max(delayMs, 16), () => {
-                        animationTimerId = 0;
-                        playGlyImageFrame(imageHandle);
-                        return GLib.SOURCE_REMOVE;
-                    });
-                } catch (error) {
-                    if (error.matches?.(Gly.LoaderError, Gly.LoaderError.NO_MORE_FRAMES))
-                        return;
-
-                    console.warn(`Hanabi preferences: failed to decode animated scene image frame "${image.src}": ${error}`);
-                }
-            });
+            stopNativeGifPaintable();
+            activeNativeGifPaintable = paintable;
+            /*
+             * Rich-media GIFs now share the same native playback path as the
+             * preview wall instead of running a second GJS Gly.Loader frame
+             * loop. The C paintable owns exactly one current texture and drops
+             * each decoded GlyFrame immediately, so the inspector can animate
+             * GIF metadata without retaining one JS wrapper per frame.
+             */
+            nativeGifSignalIds = [
+                paintable.connect('invalidate-size', () => updateNativeGifSize(paintable)),
+            ];
+            updateNativeGifSize(paintable);
+            return true;
         };
 
-        const applyGlyImage = (loader, fallback = null) => {
-            loader.load_async(null, (source, result) => {
-                if (destroyed)
-                    return;
+        const applyNativeGifFile = file => {
+            if (!imageSourceLooksGif(image.src))
+                return false;
 
-                try {
-                    activeImage = source.load_finish(result);
-                    playGlyImageFrame(activeImage);
-                } catch (error) {
-                    console.warn(`Hanabi preferences: failed to decode scene image "${image.src}" with glycin: ${error}`);
-                    fallback?.();
-                }
-            });
+            return applyNativeGifPaintable(createNativeGifPaintableForFile(file));
+        };
+
+        const applyNativeGifBytes = bytes => {
+            if (destroyed || !bytesLookLikeGif(bytes))
+                return false;
+
+            return applyNativeGifPaintable(createNativeGifPaintableForBytes(bytes));
         };
 
         const applyImageBytes = bytes => {
-            if (Gly && GlyGtk4) {
-                applyGlyImage(
-                    Gly.Loader.new_for_bytes(bytes),
-                    () => applyTexture(Gdk.Texture.new_from_bytes(bytes))
-                );
-                return;
-            }
-
             applyTexture(Gdk.Texture.new_from_bytes(bytes));
         };
 
         box.connect('destroy', () => {
             destroyed = true;
-            clearAnimationTimer();
-            activeImage = null;
+            requestCancellable.cancel();
+            stopNativeGifPaintable();
             picture.set_paintable(null);
         });
 
@@ -1879,11 +2139,20 @@ function createProjectBrowserDialog(window, settings) {
         try {
             if (/^https?:\/\//i.test(image.src)) {
                 const message = Soup.Message.new('GET', image.src);
-                sceneImageSession.send_and_read_async(message, GLib.PRIORITY_DEFAULT, null, (session, result) => {
+                sceneImageSession.send_and_read_async(message, GLib.PRIORITY_DEFAULT, requestCancellable, (session, result) => {
                     try {
                         const bytes = session.send_and_read_finish(result);
+                        if (destroyed)
+                            return;
+
+                        if (applyNativeGifBytes(bytes))
+                            return;
+
                         applyImageBytes(bytes);
-                    } catch (_error) {
+                    } catch (error) {
+                        if (destroyed || isPreviewLoadCancelled(error))
+                            return;
+
                         showError();
                     }
                 });
@@ -1893,14 +2162,10 @@ function createProjectBrowserDialog(window, settings) {
                     showError();
                     return box;
                 }
-                if (Gly && GlyGtk4) {
-                    applyGlyImage(
-                        Gly.Loader.new(file),
-                        () => applyTexture(Gdk.Texture.new_from_file(file))
-                    );
-                } else {
-                    applyTexture(Gdk.Texture.new_from_file(file));
-                }
+                if (applyNativeGifFile(file))
+                    return box;
+
+                applyTexture(Gdk.Texture.new_from_file(file));
             }
         } catch (_error) {
             showError();
@@ -2372,22 +2637,63 @@ function createProjectBrowserDialog(window, settings) {
 
     const syncSelectionState = () => {
         const currentPath = settings.get_string(currentProjectKey);
-        cards.forEach(({project, card}) => {
-            if (project.path === currentPath)
-                card.add_css_class('suggested-action');
-            else
-                card.remove_css_class('suggested-action');
-        });
+        previewWall.setSelectedPath(currentPath);
         updateLabels();
     };
 
+    const getVisibleProjects = () => Array.from(currentProjectsByPath.values())
+        .filter(project => projectMatchesCurrentFilters(project))
+        .sort(compareProjectsForCurrentSort);
+
+    const rebuildPreviewTiles = () => {
+        const visibleProjects = getVisibleProjects();
+        const visibleProjectPaths = new Set(visibleProjects.map(project => project.path));
+
+        for (const [path, tile] of Array.from(previewTileByPath.entries())) {
+            if (visibleProjectPaths.has(path))
+                continue;
+
+            tile.stop();
+            previewTileByPath.delete(path);
+        }
+
+        previewTiles.length = 0;
+        visibleProjects.forEach((project, index) => {
+            let tile = previewTileByPath.get(project.path) ?? null;
+            const previousPreviewPath = tile?.project.previewPath ?? null;
+            if (tile !== null && previousPreviewPath !== project.previewPath) {
+                tile.stop();
+                previewTileByPath.delete(project.path);
+                tile = null;
+            }
+
+            if (tile === null) {
+                tile = new ProjectPreviewTile(project, previewQueue, () => {
+                    previewWall.syncPaintables();
+                    previewWall.queue_draw();
+                });
+                previewTileByPath.set(project.path, tile);
+            } else {
+                tile.project = project;
+            }
+
+            previewTiles.push(tile);
+            tile.ensureStarted(
+                index,
+                tile.isGif ? index * PROJECT_PREVIEW_START_STAGGER_MS : 0
+            );
+        });
+
+        previewWall.setTiles(previewTiles);
+    };
+
     const updateEmptyState = () => {
-        const visibleChildren = cards.filter(({project}) => projectMatchesCurrentFilters(project)).length;
+        const visibleChildren = previewTiles.length;
         const hasVisibleCards = visibleChildren > 0;
         scrolled.visible = hasVisibleCards;
         placeholder.visible = !hasVisibleCards;
         if (!hasVisibleCards)
-            placeholder.label = cards.length > 0 ? _('No wallpapers match your search or filters') : placeholder.label;
+            placeholder.label = currentProjectsByPath.size > 0 ? _('No wallpapers match your search or filters') : placeholder.label;
     };
 
     const rebuild = () => {
@@ -2395,18 +2701,12 @@ function createProjectBrowserDialog(window, settings) {
         currentProjectsByPath = new Map(projects.map(project => [project.path, project]));
         projectSortMetadata.clear();
         rebuildFilterControls(projects);
-        while (true) {
-            const child = flowBox.get_first_child();
-            if (!child)
-                break;
-            flowBox.remove(child);
-        }
-        cards.length = 0;
 
         const hasProjects = projects.length > 0;
         scrolled.visible = hasProjects;
         placeholder.visible = !hasProjects;
         if (!hasProjects) {
+            clearPreviewTiles();
             placeholder.label = settings.get_string(libraryKey)
                 ? _('No wallpaper projects were found in this Steam library')
                 : _('Choose a Steam library first');
@@ -2415,55 +2715,23 @@ function createProjectBrowserDialog(window, settings) {
             return;
         }
 
-        projects.forEach(project => {
-            const card = createProjectCard(project, selectedProject => {
-                settings.set_string(currentProjectKey, selectedProject.path);
-                syncSelectionState();
-                buildInspector(selectedProject);
-            }, previewQueue, settings);
-            const flowChild = new Gtk.FlowBoxChild({
-                halign: Gtk.Align.START,
-                hexpand: false,
-            });
-            flowChild.set_size_request(PROJECT_CARD_WIDTH, -1);
-            flowChild.set_child(card);
-            cards.push({project, card});
-            flowBox.append(flowChild);
-        });
-
-        flowBox.invalidate_sort();
-        flowBox.invalidate_filter();
+        rebuildPreviewTiles();
         updateEmptyState();
         syncSelectionState();
         refreshInspector();
     };
 
-    flowBox.set_filter_func(child => {
-        const item = cards.find(entry => entry.card === child.get_child());
-        if (!item)
-            return false;
-
-        return projectMatchesCurrentFilters(item.project);
-    });
-
-    flowBox.set_sort_func((leftChild, rightChild) => {
-        const leftItem = cards.find(entry => entry.card === leftChild.get_child());
-        const rightItem = cards.find(entry => entry.card === rightChild.get_child());
-        if (!leftItem || !rightItem)
-            return 0;
-
-        return compareProjectsForCurrentSort(leftItem.project, rightItem.project);
-    });
-
     sortDropdown.connect('notify::selected', dropdown => {
         currentSortKey = normalizeProjectBrowserSortKey(sortOptions[dropdown.selected]?.key);
         settings.set_string(PROJECT_BROWSER_SORT_SETTINGS_KEY, currentSortKey);
-        flowBox.invalidate_sort();
+        rebuildPreviewTiles();
+        updateEmptyState();
+        syncSelectionState();
     });
 
     searchEntry.connect('search-changed', entry => {
         currentQuery = entry.text ?? '';
-        flowBox.invalidate_filter();
+        rebuildPreviewTiles();
         updateEmptyState();
     });
 
@@ -2476,7 +2744,7 @@ function createProjectBrowserDialog(window, settings) {
     });
     connectTracked(window, settings, `changed::${filterStateKey}`, () => {
         syncFilterControls();
-        flowBox.invalidate_filter();
+        rebuildPreviewTiles();
         updateEmptyState();
     });
     showInspectorMessage(null, _('Select a wallpaper to configure its properties'));

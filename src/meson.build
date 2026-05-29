@@ -231,4 +231,5 @@ install_data('schemas/@0@.gschema.xml'.format(schema),
 
 subdir('native/scene')
 subdir('native/wpe')
+subdir('native/gif')
 subdir('po')

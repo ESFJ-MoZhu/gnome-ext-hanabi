@@ -1,1 +1,3 @@
 export const enableGstCefSrcWebBackend = @enable_gstcefsrc_web_backend@;
+export const nativeSceneLibDir = '@native_scene_libdir@';
+export const nativeSceneTypelibDir = '@native_scene_typelib_dir@';
