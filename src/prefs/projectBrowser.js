@@ -981,6 +981,8 @@ class ProjectPreviewWall extends Gtk.Widget {
         this._tiles = [];
         this._lastLayout = null;
         this._lastLoggedLayoutKey = '';
+        this._allocatedWidth = 0;
+        this._allocatedWidthResizeId = 0;
         this._paintableSignalIds = new Map();
         this._selectedPath = '';
         this._onActivate = null;
@@ -1013,6 +1015,8 @@ class ProjectPreviewWall extends Gtk.Widget {
             this.queue_resize();
             this.queue_draw();
         });
+
+        this.connect('destroy', () => this._clearAllocatedWidthResize());
     }
 
     setCallbacks(onActivate, onContextMenu) {
@@ -1096,7 +1100,7 @@ class ProjectPreviewWall extends Gtk.Widget {
             return [minLogicalTileSize, naturalWidth, -1, -1];
         }
 
-        const width = forSize > 0 ? forSize : this._fallbackColumns * minLogicalTileSize;
+        const width = this._resolveMeasureWidth(forSize, minLogicalTileSize);
         const layout = this._layout.compute(
             width,
             this._tiles.length,
@@ -1104,9 +1108,19 @@ class ProjectPreviewWall extends Gtk.Widget {
             this._lastLayout,
             scaleFactor
         );
-        const rows = Math.max(1, Math.ceil(this._tiles.length / layout.columns));
-        const height = Math.ceil(rows * layout.tileSize);
+        const height = this._computeContentHeight(layout);
         return [height, height, -1, -1];
+    }
+
+    vfunc_size_allocate(width, height, baseline) {
+        super.vfunc_size_allocate(width, height, baseline);
+
+        const allocatedWidth = Math.max(0, width);
+        if (allocatedWidth === this._allocatedWidth)
+            return;
+
+        this._allocatedWidth = allocatedWidth;
+        this._queueAllocatedWidthResize();
     }
 
     vfunc_snapshot(snapshot) {
@@ -1146,6 +1160,64 @@ class ProjectPreviewWall extends Gtk.Widget {
         );
     }
 
+    _resolveMeasureWidth(forSize, minLogicalTileSize) {
+        if (forSize > 0)
+            return forSize;
+
+        if (this._allocatedWidth > 0)
+            return this._allocatedWidth;
+
+        const currentWidth = this.get_width();
+        if (currentWidth > 0)
+            return currentWidth;
+
+        /*
+         * GtkScrolledWindow can ask height-for-width children for their vertical
+         * size with forSize=-1 while it is rebuilding adjustments during a window
+         * resize.  Answering that query with the fallback natural width makes the
+         * scroll range depend on an imaginary wide grid, so a later narrow
+         * allocation can render more rows than the adjustment allows.  Before the
+         * first real allocation, use the one-column width as a conservative upper
+         * bound; after allocation, _allocatedWidth keeps measurement tied to the
+         * actual viewport width that the wall will use for drawing and hit tests.
+         */
+        return minLogicalTileSize;
+    }
+
+    _computeContentHeight(layout) {
+        return Math.ceil(this._computeRowCount(layout.columns) * layout.tileSize);
+    }
+
+    _computeRowCount(columns) {
+        return Math.max(1, Math.ceil(this._tiles.length / Math.max(1, columns)));
+    }
+
+    _queueAllocatedWidthResize() {
+        if (this._allocatedWidthResizeId !== 0)
+            return;
+
+        /*
+         * The size_allocate vfunc is reached after GtkScrolledWindow has already
+         * chosen a child allocation for the current frame. Queue one idle resize so
+         * the next measurement pass recomputes the vertical adjustment from the
+         * real viewport width recorded above, keeping the bottom row reachable
+         * after interactive dialog-width changes.
+         */
+        this._allocatedWidthResizeId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            this._allocatedWidthResizeId = 0;
+            this.queue_resize();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _clearAllocatedWidthResize() {
+        if (this._allocatedWidthResizeId === 0)
+            return;
+
+        GLib.source_remove(this._allocatedWidthResizeId);
+        this._allocatedWidthResizeId = 0;
+    }
+
     _appendTilePlaceholder(snapshot, tileSize) {
         this._tileBounds.init(0, 0, tileSize, tileSize);
         snapshot.append_color(this._placeholderColor, this._tileBounds);
@@ -1177,8 +1249,11 @@ class ProjectPreviewWall extends Gtk.Widget {
             return;
 
         this._lastLoggedLayoutKey = key;
+        const rows = this._computeRowCount(layout.columns);
+        const contentHeight = this._computeContentHeight(layout);
         console.log(
             `Hanabi preferences: preview-layout width=${width} columns=${layout.columns} ` +
+            `rows=${rows} content_height=${contentHeight} allocated_height=${this.get_height()} ` +
             `tile_size_logical=${layout.tileSize.toFixed(2)} ` +
             `tile_size_physical=${physicalTileSize.toFixed(2)} ` +
             `scale_factor=${layout.scaleFactor} ` +
