@@ -15,6 +15,11 @@ import * as BuildConfig from '../buildConfig.js';
 
 const giRepository = GIRepository.Repository.dup_default();
 
+/**
+ *
+ * @param path
+ * @param prependFn
+ */
 function prependRepositoryDir(path, prependFn) {
     if (!path || !GLib.file_test(path, GLib.FileTest.IS_DIR))
         return false;
@@ -112,12 +117,22 @@ const PROJECT_BROWSER_SORT_KEYS = {
 };
 const PROJECT_BROWSER_SORT_SETTINGS_KEY = 'project-browser-sort-key';
 
+/**
+ *
+ * @param left
+ * @param right
+ */
 function compareProjectTitles(left, right) {
     const leftTitle = `${left?.title || left?.basename || left?.path || ''}`.toLowerCase();
     const rightTitle = `${right?.title || right?.basename || right?.path || ''}`.toLowerCase();
     return leftTitle.localeCompare(rightTitle) || `${left?.path ?? ''}`.localeCompare(`${right?.path ?? ''}`);
 }
 
+/**
+ *
+ * @param left
+ * @param right
+ */
 function compareNumbersDescending(left, right) {
     // GTK only needs the sign of a sort result; normalizing the comparison
     // keeps very large directory sizes or microsecond timestamps from relying
@@ -127,6 +142,10 @@ function compareNumbersDescending(left, right) {
     return left > right ? -1 : 1;
 }
 
+/**
+ *
+ * @param info
+ */
 function getFileInfoModifiedTimeUs(info) {
     return (
         info.get_attribute_uint64('time::modified') * GLib.USEC_PER_SEC +
@@ -134,6 +153,10 @@ function getFileInfoModifiedTimeUs(info) {
     );
 }
 
+/**
+ *
+ * @param file
+ */
 function queryFileModifiedTimeUs(file) {
     try {
         const info = file.query_info(
@@ -148,10 +171,18 @@ function queryFileModifiedTimeUs(file) {
     }
 }
 
+/**
+ *
+ * @param project
+ */
 function queryProjectLastUpdatedTime(project) {
     return project?.path ? queryFileModifiedTimeUs(Gio.File.new_for_path(project.path)) : 0;
 }
 
+/**
+ *
+ * @param path
+ */
 function queryProjectDirectorySize(path) {
     let totalSize = 0;
 
@@ -186,10 +217,17 @@ function queryProjectDirectorySize(path) {
     return totalSize;
 }
 
+/**
+ *
+ */
 function sandboxSelectorFromDefault() {
     return GLY_SANDBOX_SELECTOR_AUTO;
 }
 
+/**
+ *
+ * @param source
+ */
 function imageSourceLooksGif(source) {
     if (typeof source !== 'string')
         return false;
@@ -197,6 +235,10 @@ function imageSourceLooksGif(source) {
     return source.trim().toLowerCase().split(/[?#]/, 1)[0].endsWith('.gif');
 }
 
+/**
+ *
+ * @param bytes
+ */
 function bytesLookLikeGif(bytes) {
     const data = bytes?.get_data?.();
     return data instanceof Uint8Array &&
@@ -209,6 +251,11 @@ function bytesLookLikeGif(bytes) {
         data[5] === 0x61;
 }
 
+/**
+ *
+ * @param file
+ * @param initialPhaseMs
+ */
 function createNativeGifPaintableForFile(file, initialPhaseMs = 0) {
     if (!HanabiGif?.GifPaintable)
         return null;
@@ -221,6 +268,11 @@ function createNativeGifPaintableForFile(file, initialPhaseMs = 0) {
     );
 }
 
+/**
+ *
+ * @param bytes
+ * @param initialPhaseMs
+ */
 function createNativeGifPaintableForBytes(bytes, initialPhaseMs = 0) {
     if (!HanabiGif?.GifPaintable?.new_for_bytes)
         return null;
@@ -233,16 +285,28 @@ function createNativeGifPaintableForBytes(bytes, initialPhaseMs = 0) {
     );
 }
 
+/**
+ *
+ * @param path
+ */
 function projectPreviewIsGif(path) {
     return imageSourceLooksGif(path);
 }
 
+/**
+ *
+ * @param key
+ */
 function normalizeProjectBrowserSortKey(key) {
     return Object.values(PROJECT_BROWSER_SORT_KEYS).includes(key)
         ? key
         : PROJECT_BROWSER_SORT_KEYS.NAME;
 }
 
+/**
+ *
+ * @param type
+ */
 function formatProjectTypeLabel(type) {
     switch (type) {
     case ProjectType.SCENE:
@@ -256,6 +320,10 @@ function formatProjectTypeLabel(type) {
     }
 }
 
+/**
+ *
+ * @param rating
+ */
 function formatProjectContentRatingLabel(rating) {
     switch (rating) {
     case 'Everyone':
@@ -269,6 +337,10 @@ function formatProjectContentRatingLabel(rating) {
     }
 }
 
+/**
+ *
+ * @param tag
+ */
 function formatProjectGenreLabel(tag) {
     switch (tag) {
     case 'Abstract':
@@ -326,6 +398,10 @@ function formatProjectGenreLabel(tag) {
     }
 }
 
+/**
+ *
+ * @param path
+ */
 export function formatProjectSubtitle(path) {
     if (!path)
         return _('None');
@@ -340,10 +416,19 @@ export function formatProjectSubtitle(path) {
     return `${title} (${formatProjectTypeLabel(project.type)})`;
 }
 
+/**
+ *
+ * @param path
+ */
 export function formatLibrarySubtitle(path) {
     return normalizeLibraryRootPath(path) || _('None');
 }
 
+/**
+ *
+ * @param window
+ * @param prefsGroup
+ */
 export function prefsRowLibraryPath(window, prefsGroup) {
     const settings = window._settings;
     const title = _('Steam Library');
@@ -356,6 +441,9 @@ export function prefsRowLibraryPath(window, prefsGroup) {
     });
     prefsGroup.add(row);
 
+    /**
+     *
+     */
     function createDialog() {
         let fileChooser = new Gtk.FileChooserDialog({
             title: _('Select Steam Library'),
@@ -401,6 +489,10 @@ export function prefsRowLibraryPath(window, prefsGroup) {
     });
 }
 
+/**
+ *
+ * @param project
+ */
 function buildProjectSearchText(project) {
     return [
         project.title,
@@ -411,6 +503,10 @@ function buildProjectSearchText(project) {
     ].join(' ').toLowerCase();
 }
 
+/**
+ *
+ * @param settings
+ */
 function getUserPropertyStoreFromSettings(settings) {
     // The preferences UI reads the same neutral key that the renderer watches,
     // keeping web and scene overrides synchronized without any backend-specific
@@ -418,6 +514,11 @@ function getUserPropertyStoreFromSettings(settings) {
     return settings.get_string(UserPropertyStoreKey);
 }
 
+/**
+ *
+ * @param settings
+ * @param project
+ */
 function getProjectPropertyOverrides(settings, project) {
     const userPropertyStore = getUserPropertyStoreFromSettings(settings);
     if (project?.type === 'web')
@@ -425,6 +526,12 @@ function getProjectPropertyOverrides(settings, project) {
     return getProjectScenePropertyOverrides(userPropertyStore, project);
 }
 
+/**
+ *
+ * @param settings
+ * @param project
+ * @param overrides
+ */
 function setProjectPropertyOverrides(settings, project, overrides) {
     const userPropertyStore = getUserPropertyStoreFromSettings(settings);
     const nextStore = project?.type === 'web'
@@ -440,6 +547,10 @@ function setProjectPropertyOverrides(settings, project, overrides) {
     return getProjectPropertyOverrides(settings, project);
 }
 
+/**
+ *
+ * @param error
+ */
 function isPreviewLoadCancelled(error) {
     // GIO reports user-driven dialog teardown and per-widget destruction as a
     // normal cancellation error; filtering it keeps diagnostics focused on real
@@ -609,6 +720,11 @@ async function loadCachedRemoteSceneImageBytesAsync(session, uri, cancellable) {
     return bytes;
 }
 
+/**
+ *
+ * @param path
+ * @param cancellable
+ */
 function readProjectPreviewStreamAsync(path, cancellable) {
     const file = Gio.File.new_for_path(path);
     return new Promise((resolve, reject) => {
@@ -622,6 +738,10 @@ function readProjectPreviewStreamAsync(path, cancellable) {
     });
 }
 
+/**
+ *
+ * @param stream
+ */
 function closePreviewStreamQuietlyAsync(stream) {
     if (!stream)
         return Promise.resolve();
@@ -640,6 +760,11 @@ function closePreviewStreamQuietlyAsync(stream) {
     });
 }
 
+/**
+ *
+ * @param path
+ * @param cancellable
+ */
 async function loadProjectPreviewPixbufAsync(path, cancellable) {
     let stream = null;
     try {
@@ -668,6 +793,9 @@ async function loadProjectPreviewPixbufAsync(path, cancellable) {
     }
 }
 
+/**
+ *
+ */
 function createProjectPreviewLoadQueue() {
     const queue = [];
     const activeJobs = new Set();
@@ -700,6 +828,9 @@ function createProjectPreviewLoadQueue() {
         schedule();
     };
 
+    /**
+     *
+     */
     function pump() {
         while (!destroyed && activeCount < PROJECT_THUMBNAIL_CONCURRENCY && queue.length > 0) {
             const job = queue.shift();
@@ -1270,6 +1401,10 @@ class ProjectPreviewWall extends Gtk.Widget {
     }
 });
 
+/**
+ *
+ * @param project
+ */
 function openProjectDirectory(project) {
     const path = project?.path;
     if (!path) {
@@ -1294,6 +1429,10 @@ function openProjectDirectory(project) {
     }
 }
 
+/**
+ *
+ * @param anchorWidget
+ */
 function getProjectPreviewWindowDimension(anchorWidget) {
     const scaleFactor = anchorWidget?.get_scale_factor?.() ?? 1;
     const safeScaleFactor = Number.isFinite(scaleFactor) && scaleFactor > 0
@@ -1304,6 +1443,10 @@ function getProjectPreviewWindowDimension(anchorWidget) {
     return `${width}:${height}`;
 }
 
+/**
+ *
+ * @param settings
+ */
 function getGpuPipelinePreviewEnvironment(settings) {
     let gpuPipeline = 'auto';
     try {
@@ -1317,6 +1460,13 @@ function getGpuPipelinePreviewEnvironment(settings) {
     );
 }
 
+/**
+ *
+ * @param project
+ * @param windowed
+ * @param anchorWidget
+ * @param settings
+ */
 function launchProjectPreview(project, windowed, anchorWidget = null, settings = null) {
     const path = project?.path;
     if (!path) {
@@ -1359,6 +1509,11 @@ function launchProjectPreview(project, windowed, anchorWidget = null, settings =
     }
 }
 
+/**
+ *
+ * @param preview
+ * @param settings
+ */
 function createProjectPreviewContextMenu(preview, settings) {
     const actions = new Gio.SimpleActionGroup();
     let currentProject = null;
@@ -1383,7 +1538,7 @@ function createProjectPreviewContextMenu(preview, settings) {
     menu.append_submenu(_('Preview'), previewMenu);
     menu.append(_('Open Wallpaper Folder'), 'thumbnail.open-folder');
 
-    const popover = Gtk.PopoverMenu.new_from_model(menu);
+    const popover = Gtk.PopoverMenu.new_from_model_full(menu, Gtk.PopoverMenuFlags.NESTED);
     popover.set_parent(preview);
     preview.connect('destroy', () => popover.unparent());
 
@@ -1406,6 +1561,10 @@ function createProjectPreviewContextMenu(preview, settings) {
     };
 }
 
+/**
+ *
+ * @param text
+ */
 function stripScenePropertyMarkup(text) {
     if (typeof text !== 'string')
         return '';
@@ -1427,11 +1586,20 @@ function stripScenePropertyMarkup(text) {
         .trim();
 }
 
+/**
+ *
+ * @param text
+ * @param fallback
+ */
 function formatScenePropertyLabel(text, fallback = _('Untitled')) {
     const label = stripScenePropertyMarkup(text);
     return label || fallback;
 }
 
+/**
+ *
+ * @param text
+ */
 function decodeScenePropertyMarkupEntities(text) {
     return text
         .replace(/&nbsp;/gi, ' ')
@@ -1503,6 +1671,11 @@ function normalizeScenePropertyMarkupNesting(markup) {
     return chunks.join('');
 }
 
+/**
+ *
+ * @param text
+ * @param fallback
+ */
 function formatScenePropertyMarkup(text, fallback = _('Untitled')) {
     const source = typeof text === 'string' && text.trim() !== '' ? text : fallback;
     const tagPlaceholders = new Map([
@@ -1577,6 +1750,10 @@ function formatScenePropertyMarkup(text, fallback = _('Untitled')) {
     return normalizeScenePropertyMarkupNesting(markup);
 }
 
+/**
+ *
+ * @param text
+ */
 function scenePropertyUsesCenteredMarkup(text) {
     return typeof text === 'string' && /<center\b/i.test(text);
 }
@@ -1672,10 +1849,19 @@ function parseScenePropertyImageBlocks(text) {
     return blocks;
 }
 
+/**
+ *
+ * @param text
+ */
 function parseScenePropertyImages(text) {
     return parseScenePropertyImageBlocks(text).map(block => block.image);
 }
 
+/**
+ *
+ * @param text
+ * @param fallback
+ */
 function formatScenePropertyDisplayTitle(text, fallback = _('Untitled')) {
     const label = stripScenePropertyMarkup(text);
     if (label)
@@ -1684,6 +1870,10 @@ function formatScenePropertyDisplayTitle(text, fallback = _('Untitled')) {
     return parseScenePropertyImages(text).length > 0 ? '' : fallback;
 }
 
+/**
+ *
+ * @param suffixWidth
+ */
 function getInspectorContentMaxWidth(suffixWidth = 0) {
     return Math.max(
         96,
@@ -1691,6 +1881,10 @@ function getInspectorContentMaxWidth(suffixWidth = 0) {
     );
 }
 
+/**
+ *
+ * @param defaultValue
+ */
 function getColorComponentCount(defaultValue) {
     if (typeof defaultValue !== 'string')
         return 3;
@@ -1702,6 +1896,10 @@ function getColorComponentCount(defaultValue) {
     return components.length >= 4 ? 4 : 3;
 }
 
+/**
+ *
+ * @param value
+ */
 function parseScenePropertyColor(value) {
     const rgba = new Gdk.RGBA();
     if (typeof value === 'string') {
@@ -1733,6 +1931,11 @@ function parseScenePropertyColor(value) {
     return rgba;
 }
 
+/**
+ *
+ * @param rgba
+ * @param defaultValue
+ */
 function serializeScenePropertyColor(rgba, defaultValue) {
     const componentCount = getColorComponentCount(defaultValue);
     const components = [
@@ -1750,6 +1953,10 @@ function serializeScenePropertyColor(rgba, defaultValue) {
         .join(' ');
 }
 
+/**
+ *
+ * @param step
+ */
 function getStepDigits(step) {
     if (typeof step !== 'number' || !Number.isFinite(step))
         return 0;
@@ -1759,6 +1966,11 @@ function getStepDigits(step) {
     return dotIndex >= 0 ? trimmed.length - dotIndex - 1 : 0;
 }
 
+/**
+ *
+ * @param window
+ * @param settings
+ */
 function createProjectBrowserDialog(window, settings) {
     const currentProjectKey = 'project-path';
     const libraryKey = 'change-wallpaper-directory-path';
@@ -2665,6 +2877,10 @@ function createProjectBrowserDialog(window, settings) {
         updateInspectorVisibility();
     };
 
+    /**
+     *
+     * @param property
+     */
     function createInspectorPropertyWidget(property) {
         const title = formatScenePropertyDisplayTitle(property.text, property.name);
         const currentValue = normalizeScenePropertyValue(
@@ -2896,6 +3112,11 @@ function createProjectBrowserDialog(window, settings) {
         });
     }
 
+    /**
+     *
+     * @param project
+     * @param message
+     */
     function showInspectorMessage(project, message) {
         clearInspectorContent();
         currentInspectorProject = project ?? null;
@@ -2904,6 +3125,10 @@ function createProjectBrowserDialog(window, settings) {
         inspectorStack.set_visible_child_name('message');
     }
 
+    /**
+     *
+     * @param project
+     */
     function buildInspector(project) {
         clearInspectorContent();
         currentInspectorProject = project;
@@ -3095,6 +3320,11 @@ function createProjectBrowserDialog(window, settings) {
     return dialog;
 }
 
+/**
+ *
+ * @param window
+ * @param prefsGroup
+ */
 export function prefsRowProjectChooser(window, prefsGroup) {
     const settings = window._settings;
     const currentProjectKey = 'project-path';
