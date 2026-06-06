@@ -73,11 +73,18 @@ const extensionDir = GLib.path_get_dirname(moduleDir);
 const rendererScriptPath = GLib.build_filenamev([extensionDir, 'renderer', 'renderer.js']);
 
 // Match the native GIF stress-test grid: square previews fill the available
-// width with no gutter, only adding a new column when the current physical tile
-// size would exceed this range on the active monitor scale.
+// width, only adding a new column when the current physical tile size would
+// exceed this range on the active monitor scale.
 const PROJECT_PREVIEW_INITIAL_COLUMNS = 8;
 const PROJECT_PREVIEW_MIN_TILE_SIZE = 256;
 const PROJECT_PREVIEW_MAX_TILE_SIZE = 384;
+const PROJECT_PREVIEW_TILE_SPACING = 2;
+const PROJECT_PREVIEW_HOVER_SCALE = 1.3;
+const PROJECT_PREVIEW_HOVER_ANIMATION_MS = 220;
+const PROJECT_PREVIEW_TITLE_HEIGHT_RATIO = 0.18;
+const PROJECT_PREVIEW_TITLE_MIN_HEIGHT = 34;
+const PROJECT_PREVIEW_TITLE_MAX_HEIGHT = 56;
+const PROJECT_PREVIEW_TITLE_HORIZONTAL_PADDING = 10;
 const PROJECT_PREVIEW_STATIC_TEXTURE_SIZE = PROJECT_PREVIEW_MAX_TILE_SIZE;
 const PROJECT_PREVIEW_MIN_FRAME_DELAY_MS = 20;
 const PROJECT_PREVIEW_START_STAGGER_MS = 25;
@@ -896,9 +903,10 @@ class SourceBag {
 }
 
 class AdaptiveTileLayout {
-    constructor(minTileSize, maxTileSize) {
+    constructor(minTileSize, maxTileSize, tileSpacing = 0) {
         this._minTileSize = minTileSize;
         this._maxTileSize = Math.max(minTileSize, maxTileSize);
+        this._tileSpacing = Math.max(0, tileSpacing);
     }
 
     get minTileSize() {
@@ -909,8 +917,17 @@ class AdaptiveTileLayout {
         return this._maxTileSize;
     }
 
+    get tileSpacing() {
+        return this._tileSpacing;
+    }
+
     getMinLogicalTileSize(scaleFactor) {
         return this._logicalThresholds(scaleFactor).minTileSize;
+    }
+
+    computeGridWidth(columns, tileSize) {
+        const boundedColumns = Math.max(1, columns);
+        return boundedColumns * tileSize + Math.max(0, boundedColumns - 1) * this._tileSpacing;
     }
 
     compute(viewportWidth, itemCount, fallbackColumns, currentLayout = null, scaleFactor = 1) {
@@ -929,24 +946,31 @@ class AdaptiveTileLayout {
          * wall: GTK measures in logical pixels, while the knobs are physical
          * preview sizes. Existing columns are kept while still inside the range
          * so scrollbar and resize jitter do not cause constant grid reshuffles.
+         * The inter-tile spacing is part of the layout math instead of a drawing
+         * afterthought, keeping scrolling height and pointer hit testing aligned
+         * with the two visible pixels between wallpaper cards.
          */
         let columns = 0;
-        if (currentLayout !== null && currentLayout.scaleFactor === thresholds.scaleFactor) {
+        if (
+            currentLayout !== null &&
+            currentLayout.scaleFactor === thresholds.scaleFactor &&
+            currentLayout.tileSpacing === this._tileSpacing
+        ) {
             const currentColumns = Math.max(1, currentLayout.columns);
-            const currentTileSize = viewportWidth / currentColumns;
+            const currentTileSize = this._computeTileSizeForColumns(viewportWidth, currentColumns);
             if (currentTileSize >= thresholds.minTileSize && currentTileSize <= thresholds.maxTileSize)
                 return this._createLayout(currentColumns, Math.max(1, currentTileSize), thresholds);
 
             columns = currentTileSize > thresholds.maxTileSize
-                ? Math.ceil(viewportWidth / thresholds.maxTileSize)
-                : Math.floor(viewportWidth / thresholds.minTileSize);
+                ? this._computeColumnsForTileLimit(viewportWidth, thresholds.maxTileSize, Math.ceil)
+                : this._computeColumnsForTileLimit(viewportWidth, thresholds.minTileSize, Math.floor);
         }
 
         if (columns <= 0)
-            columns = Math.ceil(viewportWidth / thresholds.maxTileSize);
+            columns = this._computeColumnsForTileLimit(viewportWidth, thresholds.maxTileSize, Math.ceil);
 
         const boundedColumns = Math.max(1, columns);
-        const tileSize = Math.max(1, viewportWidth / boundedColumns);
+        const tileSize = this._computeTileSizeForColumns(viewportWidth, boundedColumns);
         return this._createLayout(boundedColumns, tileSize, thresholds);
     }
 
@@ -961,10 +985,21 @@ class AdaptiveTileLayout {
         };
     }
 
+    _computeColumnsForTileLimit(viewportWidth, tileLimit, roundFn) {
+        return roundFn((viewportWidth + this._tileSpacing) / (tileLimit + this._tileSpacing));
+    }
+
+    _computeTileSizeForColumns(viewportWidth, columns) {
+        const boundedColumns = Math.max(1, columns);
+        const usedSpacing = Math.max(0, boundedColumns - 1) * this._tileSpacing;
+        return Math.max(1, (viewportWidth - usedSpacing) / boundedColumns);
+    }
+
     _createLayout(columns, tileSize, thresholds) {
         return {
             columns,
             tileSize,
+            tileSpacing: this._tileSpacing,
             scaleFactor: thresholds.scaleFactor,
             minLogicalTileSize: thresholds.minTileSize,
             maxLogicalTileSize: thresholds.maxTileSize,
@@ -1098,6 +1133,19 @@ class ProjectPreviewTile {
     }
 }
 
+/**
+ *
+ * @param project
+ */
+function formatProjectPreviewTitle(project) {
+    const title = `${project?.title || project?.basename || ''}`.trim();
+    if (title)
+        return title;
+
+    const path = `${project?.path ?? ''}`.trim();
+    return path ? GLib.path_get_basename(path) : _('Untitled');
+}
+
 const ProjectPreviewWall = GObject.registerClass(
 class ProjectPreviewWall extends Gtk.Widget {
     _init(layout, fallbackColumns) {
@@ -1116,13 +1164,20 @@ class ProjectPreviewWall extends Gtk.Widget {
         this._allocatedWidthResizeId = 0;
         this._paintableSignalIds = new Map();
         this._selectedPath = '';
+        this._hoveredPath = '';
+        this._hoverAnimations = new Map();
+        this._hoverTickId = 0;
         this._onActivate = null;
         this._onContextMenu = null;
         this._tileOffset = new Graphene.Point();
         this._tileBounds = new Graphene.Rect();
+        this._tileClipBounds = new Graphene.Rect();
+        this._titleBounds = new Graphene.Rect();
         this._selectionRects = Array.from({length: 4}, () => new Graphene.Rect());
         this._placeholderColor = new Gdk.RGBA({red: 0.20, green: 0.20, blue: 0.20, alpha: 0.28});
         this._selectedColor = new Gdk.RGBA({red: 0.20, green: 0.48, blue: 0.95, alpha: 0.92});
+        this._titleBackgroundColor = new Gdk.RGBA({red: 0.03, green: 0.04, blue: 0.06, alpha: 0.58});
+        this._titleTextColor = new Gdk.RGBA({red: 1, green: 1, blue: 1, alpha: 0.92});
 
         const primaryGesture = new Gtk.GestureClick({button: PROJECT_CARD_PRIMARY_BUTTON});
         primaryGesture.connect('released', (_gesture, _nPress, x, y) => {
@@ -1140,6 +1195,12 @@ class ProjectPreviewWall extends Gtk.Widget {
         });
         this.add_controller(secondaryGesture);
 
+        const motionController = new Gtk.EventControllerMotion();
+        motionController.connect('enter', (_controller, x, y) => this._setHoveredTile(this.tileAt(x, y)));
+        motionController.connect('motion', (_controller, x, y) => this._setHoveredTile(this.tileAt(x, y)));
+        motionController.connect('leave', () => this._setHoveredTile(null));
+        this.add_controller(motionController);
+
         this.connect('notify::scale-factor', () => {
             this._lastLayout = null;
             this._lastLoggedLayoutKey = '';
@@ -1147,7 +1208,10 @@ class ProjectPreviewWall extends Gtk.Widget {
             this.queue_draw();
         });
 
-        this.connect('destroy', () => this._clearAllocatedWidthResize());
+        this.connect('destroy', () => {
+            this._clearAllocatedWidthResize();
+            this._clearHoverAnimations();
+        });
     }
 
     setCallbacks(onActivate, onContextMenu) {
@@ -1158,6 +1222,13 @@ class ProjectPreviewWall extends Gtk.Widget {
     setTiles(tiles) {
         this._disconnectPaintables();
         this._tiles = tiles;
+        const visiblePaths = new Set(this._tiles.map(tile => tile.project.path));
+        if (this._hoveredPath && !visiblePaths.has(this._hoveredPath))
+            this._hoveredPath = '';
+        for (const path of Array.from(this._hoverAnimations.keys())) {
+            if (!visiblePaths.has(path))
+                this._hoverAnimations.delete(path);
+        }
         this.syncPaintables();
         this.queue_resize();
         this.queue_draw();
@@ -1208,9 +1279,15 @@ class ProjectPreviewWall extends Gtk.Widget {
         if (layout.tileSize <= 0)
             return null;
 
-        const column = Math.floor(x / layout.tileSize);
-        const row = Math.floor(y / layout.tileSize);
+        const stride = layout.tileSize + layout.tileSpacing;
+        const column = Math.floor(x / stride);
+        const row = Math.floor(y / stride);
         if (column < 0 || column >= layout.columns || row < 0)
+            return null;
+
+        const localX = x - column * stride;
+        const localY = y - row * stride;
+        if (localX < 0 || localX >= layout.tileSize || localY < 0 || localY >= layout.tileSize)
             return null;
 
         const index = row * layout.columns + column;
@@ -1227,7 +1304,7 @@ class ProjectPreviewWall extends Gtk.Widget {
 
         if (orientation === Gtk.Orientation.HORIZONTAL) {
             const naturalColumns = Math.max(1, Math.min(this._tiles.length || 1, this._fallbackColumns));
-            const naturalWidth = naturalColumns * minLogicalTileSize;
+            const naturalWidth = this._layout.computeGridWidth(naturalColumns, minLogicalTileSize);
             return [minLogicalTileSize, naturalWidth, -1, -1];
         }
 
@@ -1262,17 +1339,21 @@ class ProjectPreviewWall extends Gtk.Widget {
         this._tiles.forEach((tile, index) => {
             const column = index % layout.columns;
             const row = Math.floor(index / layout.columns);
-            const x = column * layout.tileSize;
-            const y = row * layout.tileSize;
+            const stride = layout.tileSize + layout.tileSpacing;
+            const x = column * stride;
+            const y = row * stride;
 
             snapshot.save();
             this._tileOffset.init(x, y);
             snapshot.translate(this._tileOffset);
 
-            if (tile.paintable)
-                tile.paintable.snapshot(snapshot, layout.tileSize, layout.tileSize);
-            else
-                this._appendTilePlaceholder(snapshot, layout.tileSize);
+            this._appendTileImage(
+                snapshot,
+                tile,
+                layout.tileSize,
+                this._getHoverProgress(tile.project.path)
+            );
+            this._appendTileTitle(snapshot, tile, layout.tileSize);
 
             if (tile.project.path === this._selectedPath)
                 this._appendSelectionBorder(snapshot, layout.tileSize);
@@ -1316,7 +1397,8 @@ class ProjectPreviewWall extends Gtk.Widget {
     }
 
     _computeContentHeight(layout) {
-        return Math.ceil(this._computeRowCount(layout.columns) * layout.tileSize);
+        const rows = this._computeRowCount(layout.columns);
+        return Math.ceil(rows * layout.tileSize + Math.max(0, rows - 1) * layout.tileSpacing);
     }
 
     _computeRowCount(columns) {
@@ -1349,6 +1431,156 @@ class ProjectPreviewWall extends Gtk.Widget {
         this._allocatedWidthResizeId = 0;
     }
 
+    _setHoveredTile(tile) {
+        const path = tile?.project?.path ?? '';
+        if (path === this._hoveredPath)
+            return;
+
+        const nowUsec = GLib.get_monotonic_time();
+        const previousPath = this._hoveredPath;
+        const previousProgress = previousPath ? this._getHoverProgress(previousPath, nowUsec) : 0;
+        const nextProgress = path ? this._getHoverProgress(path, nowUsec) : 0;
+        this._hoveredPath = path;
+        if (previousPath)
+            this._startHoverAnimation(previousPath, 0, previousProgress, nowUsec);
+        if (path)
+            this._startHoverAnimation(path, 1, nextProgress, nowUsec);
+        this.queue_draw();
+    }
+
+    _startHoverAnimation(path, targetProgress, fromProgress = this._getHoverProgress(path), nowUsec = GLib.get_monotonic_time()) {
+        const boundedTargetProgress = Math.max(0, Math.min(1, targetProgress));
+        if (fromProgress === boundedTargetProgress) {
+            if (boundedTargetProgress === 0)
+                this._hoverAnimations.delete(path);
+            return;
+        }
+
+        this._hoverAnimations.set(path, {
+            fromProgress,
+            targetProgress: boundedTargetProgress,
+            startedUsec: nowUsec,
+        });
+        this._ensureHoverTick();
+    }
+
+    _ensureHoverTick() {
+        if (this._hoverTickId !== 0)
+            return;
+
+        this._hoverTickId = this.add_tick_callback((_widget, frameClock) => {
+            const nowUsec = frameClock?.get_frame_time?.() ?? GLib.get_monotonic_time();
+            for (const [path, animation] of Array.from(this._hoverAnimations.entries())) {
+                if (!this._hoverAnimationIsComplete(animation, nowUsec))
+                    continue;
+
+                this._hoverAnimations.delete(path);
+            }
+
+            this.queue_draw();
+            if (this._hoverAnimations.size > 0)
+                return GLib.SOURCE_CONTINUE;
+
+            this._hoverTickId = 0;
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _clearHoverAnimations() {
+        if (this._hoverTickId !== 0) {
+            this.remove_tick_callback(this._hoverTickId);
+            this._hoverTickId = 0;
+        }
+
+        this._hoverAnimations.clear();
+    }
+
+    _getHoverProgress(path, nowUsec = GLib.get_monotonic_time()) {
+        const animation = this._hoverAnimations.get(path);
+        if (!animation)
+            return path === this._hoveredPath ? 1 : 0;
+
+        return this._interpolateHoverAnimation(animation, nowUsec);
+    }
+
+    _interpolateHoverAnimation(animation, nowUsec) {
+        const durationUsec = PROJECT_PREVIEW_HOVER_ANIMATION_MS * 1000;
+        const elapsedUsec = Math.max(0, nowUsec - animation.startedUsec);
+        const progress = Math.min(1, elapsedUsec / durationUsec);
+        const easedProgress = this._easeHoverProgress(progress);
+        return animation.fromProgress +
+            (animation.targetProgress - animation.fromProgress) * easedProgress;
+    }
+
+    _hoverAnimationIsComplete(animation, nowUsec) {
+        const durationUsec = PROJECT_PREVIEW_HOVER_ANIMATION_MS * 1000;
+        return nowUsec - animation.startedUsec >= durationUsec;
+    }
+
+    _easeHoverProgress(progress) {
+        const boundedProgress = Math.max(0, Math.min(1, progress));
+        return 1 - Math.pow(1 - boundedProgress, 3);
+    }
+
+    _appendTileImage(snapshot, tile, tileSize, hoverProgress) {
+        this._tileClipBounds.init(0, 0, tileSize, tileSize);
+        snapshot.push_clip(this._tileClipBounds);
+
+        if (tile.paintable) {
+            const scale = 1 + (PROJECT_PREVIEW_HOVER_SCALE - 1) * hoverProgress;
+            const paintableSize = tileSize * scale;
+            const paintableOffset = (tileSize - paintableSize) / 2;
+
+            /*
+             * Gtk.Paintable has no object-fit mode at this layer: snapshotting a
+             * larger paintable and clipping the card bounds gives the requested
+             * hover zoom without changing allocation, scroll height, or hit boxes.
+             * The scale receives a cubic ease-out progress value from the GTK
+             * frame clock, so the card reacts quickly and then settles smoothly.
+             */
+            snapshot.save();
+            this._tileOffset.init(paintableOffset, paintableOffset);
+            snapshot.translate(this._tileOffset);
+            tile.paintable.snapshot(snapshot, paintableSize, paintableSize);
+            snapshot.restore();
+        } else {
+            this._appendTilePlaceholder(snapshot, tileSize);
+        }
+
+        snapshot.pop();
+    }
+
+    _appendTileTitle(snapshot, tile, tileSize) {
+        const titleHeight = this._computeTitleHeight(tileSize);
+        const titleY = Math.max(0, tileSize - titleHeight);
+        this._titleBounds.init(0, titleY, tileSize, titleHeight);
+        snapshot.append_color(this._titleBackgroundColor, this._titleBounds);
+
+        const padding = Math.min(PROJECT_PREVIEW_TITLE_HORIZONTAL_PADDING, Math.max(0, tileSize / 10));
+        const layout = this.create_pango_layout(formatProjectPreviewTitle(tile.project));
+        layout.set_ellipsize(Pango.EllipsizeMode.END);
+        layout.set_single_paragraph_mode(true);
+        layout.set_width(Math.max(1, Math.round((tileSize - padding * 2) * Pango.SCALE)));
+
+        const [, textHeight] = layout.get_pixel_size();
+        const textY = titleY + Math.max(0, (titleHeight - textHeight) / 2);
+        snapshot.save();
+        this._tileOffset.init(padding, textY);
+        snapshot.translate(this._tileOffset);
+        snapshot.append_layout(layout, this._titleTextColor);
+        snapshot.restore();
+    }
+
+    _computeTitleHeight(tileSize) {
+        return Math.max(
+            PROJECT_PREVIEW_TITLE_MIN_HEIGHT,
+            Math.min(
+                PROJECT_PREVIEW_TITLE_MAX_HEIGHT,
+                Math.round(tileSize * PROJECT_PREVIEW_TITLE_HEIGHT_RATIO)
+            )
+        );
+    }
+
     _appendTilePlaceholder(snapshot, tileSize) {
         this._tileBounds.init(0, 0, tileSize, tileSize);
         snapshot.append_color(this._placeholderColor, this._tileBounds);
@@ -1375,7 +1607,7 @@ class ProjectPreviewWall extends Gtk.Widget {
 
     _logLayoutChange(width, layout) {
         const physicalTileSize = layout.tileSize * layout.scaleFactor;
-        const key = `${width}:${layout.columns}:${layout.tileSize}:${layout.scaleFactor}`;
+        const key = `${width}:${layout.columns}:${layout.tileSize}:${layout.tileSpacing}:${layout.scaleFactor}`;
         if (key === this._lastLoggedLayoutKey)
             return;
 
@@ -1391,7 +1623,8 @@ class ProjectPreviewWall extends Gtk.Widget {
             `min_tile_size_physical=${this._layout.minTileSize} ` +
             `max_tile_size_physical=${this._layout.maxTileSize} ` +
             `min_tile_size_logical=${layout.minLogicalTileSize} ` +
-            `max_tile_size_logical=${layout.maxLogicalTileSize} gap=0`
+            `max_tile_size_logical=${layout.maxLogicalTileSize} ` +
+            `gap=${layout.tileSpacing}`
         );
     }
 
@@ -2124,7 +2357,8 @@ function createProjectBrowserDialog(window, settings) {
     });
     const previewLayout = new AdaptiveTileLayout(
         PROJECT_PREVIEW_MIN_TILE_SIZE,
-        PROJECT_PREVIEW_MAX_TILE_SIZE
+        PROJECT_PREVIEW_MAX_TILE_SIZE,
+        PROJECT_PREVIEW_TILE_SPACING
     );
     const previewWall = new ProjectPreviewWall(previewLayout, PROJECT_PREVIEW_INITIAL_COLUMNS);
     scrolled.set_child(previewWall);
