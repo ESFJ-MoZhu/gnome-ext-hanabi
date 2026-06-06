@@ -8,6 +8,30 @@ src_dir='@gstcefsrc_source_dir@'
 build_dir='@gstcefsrc_build_dir@'
 stage_dir='@gstcefsrc_stage_dir@'
 cef_root_dir='@gstcefsrc_cef_root_dir@'
+cef_distribution_suffix='@gstcefsrc_cef_distribution_suffix@'
+strip_tool="${STRIP:-strip}"
+
+strip_unneeded_if_present() {
+    binary_path="$1"
+    if [ ! -f "$binary_path" ]; then
+        return
+    fi
+
+    if ! command -v "$strip_tool" >/dev/null 2>&1; then
+        echo "strip tool not found: $strip_tool" >&2
+        exit 1
+    fi
+
+    # The Linux minimal CEF archive removes sample applications and other
+    # bundle extras, but upstream still ships libcef.so with DWARF debug
+    # sections and full symbol tables. Strip only the copied build/stage
+    # artifacts so the downloaded CEF tree remains an untouched, hash-verified
+    # upstream source for future rebuilds.
+    before_size="$(wc -c < "$binary_path" | tr -d ' ')"
+    "$strip_tool" --strip-unneeded "$binary_path"
+    after_size="$(wc -c < "$binary_path" | tr -d ' ')"
+    echo "==> Stripped $binary_path: $before_size -> $after_size bytes"
+}
 
 if [ ! -f "$download_stamp_path" ]; then
     echo "gstcefsrc CEF download stamp not found: $download_stamp_path" >&2
@@ -25,12 +49,17 @@ mkdir -p "$build_dir"
 cmake -S "$src_dir" -B "$build_dir" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCEF_ROOT="$cef_root_dir" \
+    -DCEF_DISTRIBUTION_SUFFIX="$cef_distribution_suffix" \
     -DCMAKE_INSTALL_PREFIX="$stage_dir"
 
 echo "==> Building gstcefsrc native bridge"
 cmake --build "$build_dir" --config Release --verbose
 
+strip_unneeded_if_present "$build_dir/Release/libcef.so"
+
 echo "==> Collecting gstcefsrc build artifacts"
 cmake --install "$build_dir" --config Release
+
+strip_unneeded_if_present "$stage_dir/libcef.so"
 
 touch "$stamp_path"

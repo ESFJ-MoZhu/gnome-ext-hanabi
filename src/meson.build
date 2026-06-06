@@ -41,6 +41,7 @@ configured_native_runtime = configure_file(
 if get_option('gstcefsrc-web-backend')
   gstcefsrc_cef_version = '139.0.28+g55ab8a8+chromium-139.0.7258.139'
   gstcefsrc_cef_escaped_version = '139.0.28%2Bg55ab8a8%2Bchromium-139.0.7258.139'
+  gstcefsrc_cef_distribution_suffix = '_minimal'
   gstcefsrc_cef_platform = ''
   if host_machine.system() == 'linux'
     if ['aarch64', 'arm', 'arm64'].contains(host_machine.cpu_family())
@@ -80,6 +81,7 @@ if get_option('gstcefsrc-web-backend')
   gstcefsrc_buildconf.set('gstcefsrc_cef_platform', gstcefsrc_cef_platform)
   gstcefsrc_buildconf.set('gstcefsrc_cef_version', gstcefsrc_cef_version)
   gstcefsrc_buildconf.set('gstcefsrc_cef_escaped_version', gstcefsrc_cef_escaped_version)
+  gstcefsrc_buildconf.set('gstcefsrc_cef_distribution_suffix', gstcefsrc_cef_distribution_suffix)
   gstcefsrc_buildconf.set(
     'gstcefsrc_cef_root_dir',
     join_paths(
@@ -90,7 +92,11 @@ if get_option('gstcefsrc-web-backend')
       'gstcefsrc',
       'third_party',
       'cef',
-      'cef_binary_@0@_@1@'.format(gstcefsrc_cef_version, gstcefsrc_cef_platform),
+      'cef_binary_@0@_@1@@2@'.format(
+        gstcefsrc_cef_version,
+        gstcefsrc_cef_platform,
+        gstcefsrc_cef_distribution_suffix,
+      ),
     )
   )
 
