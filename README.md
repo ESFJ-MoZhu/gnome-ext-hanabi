@@ -76,7 +76,7 @@ Required for the bundled native backends built by Hanabi:
 If any of these are missing, Hanabi may still install but some project types will fall back to placeholders or reduced functionality.
 
 1. Clone the repo
-
+这里的仓库怎么是别人的仓库，是写错了吗(?
 - **For GNOME 45 and later**
     ```
     git clone https://github.com/jeffshee/gnome-ext-hanabi.git
